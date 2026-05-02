@@ -3,8 +3,8 @@ return {
     name = "ReaSRTBrowser",
     id = "ReaSRTBrowser",
     window_title = "ReaSRTBrowser",
-    default_language = "en",
-    fallback_language = "en",
+    default_language = "ja",
+    fallback_language = "ja",
   },
 
   fonts = {
