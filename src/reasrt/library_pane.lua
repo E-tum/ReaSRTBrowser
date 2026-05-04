@@ -186,9 +186,6 @@ return function(env)
       if reaper.ImGui_MenuItem(ctx, t("menu.new_library")) then
         LibraryPane.prompt_create_library()
       end
-      LibraryPane.draw_library_choice_menu(t("menu.add_selected_srts_to_library"), function(target_library_id)
-        LibraryPane.add_selected_sources_to_library(target_library_id)
-      end)
       reaper.ImGui_EndPopup(ctx)
     end
   end

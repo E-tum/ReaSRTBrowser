@@ -29,6 +29,97 @@ if not reaper.ImGui_CreateContext then
   return
 end
 
+local INSTANCE_EXTSTATE_SECTION = APP_NAME
+local INSTANCE_EXTSTATE_KEY = "running_instance"
+local INSTANCE_FOCUS_REQUEST_KEY = "focus_request"
+local INSTANCE_HEARTBEAT_TIMEOUT_SEC = 30.0
+local INSTANCE_HEARTBEAT_INTERVAL_SEC = 1.0
+local instance_id = ("%s:%s"):format(tostring(Core.now_sec(reaper)), tostring({}))
+local last_instance_heartbeat_at = 0
+
+local function read_running_instance()
+  if not reaper.GetExtState then
+    return nil, nil
+  end
+
+  local value = reaper.GetExtState(INSTANCE_EXTSTATE_SECTION, INSTANCE_EXTSTATE_KEY)
+  if not value or value == "" then
+    return nil, nil
+  end
+
+  local existing_id, heartbeat_text = value:match("^([^|]+)|([%d%.]+)$")
+  return existing_id, tonumber(heartbeat_text)
+end
+
+local function write_running_instance(force)
+  if not reaper.SetExtState then
+    return
+  end
+
+  local now = Core.now_sec(reaper)
+  if not force and (now - last_instance_heartbeat_at) < INSTANCE_HEARTBEAT_INTERVAL_SEC then
+    return
+  end
+
+  last_instance_heartbeat_at = now
+  reaper.SetExtState(
+    INSTANCE_EXTSTATE_SECTION,
+    INSTANCE_EXTSTATE_KEY,
+    ("%s|%.6f"):format(instance_id, now),
+    false
+  )
+end
+
+local function request_existing_instance_focus()
+  if not reaper.SetExtState then
+    return
+  end
+
+  reaper.SetExtState(
+    INSTANCE_EXTSTATE_SECTION,
+    INSTANCE_FOCUS_REQUEST_KEY,
+    ("%.6f"):format(Core.now_sec(reaper)),
+    false
+  )
+end
+
+local function consume_instance_focus_request()
+  if not reaper.GetExtState then
+    return false
+  end
+
+  local value = reaper.GetExtState(INSTANCE_EXTSTATE_SECTION, INSTANCE_FOCUS_REQUEST_KEY)
+  if not value or value == "" then
+    return false
+  end
+
+  if reaper.DeleteExtState then
+    reaper.DeleteExtState(INSTANCE_EXTSTATE_SECTION, INSTANCE_FOCUS_REQUEST_KEY, false)
+  end
+  return true
+end
+
+local function release_running_instance()
+  local existing_id = read_running_instance()
+  if existing_id == instance_id and reaper.DeleteExtState then
+    reaper.DeleteExtState(INSTANCE_EXTSTATE_SECTION, INSTANCE_EXTSTATE_KEY, false)
+    reaper.DeleteExtState(INSTANCE_EXTSTATE_SECTION, INSTANCE_FOCUS_REQUEST_KEY, false)
+  end
+end
+
+local existing_instance_id, existing_instance_heartbeat = read_running_instance()
+if existing_instance_id
+  and existing_instance_heartbeat
+  and (Core.now_sec(reaper) - existing_instance_heartbeat) < INSTANCE_HEARTBEAT_TIMEOUT_SEC then
+  request_existing_instance_focus()
+  return
+end
+
+write_running_instance(true)
+if reaper.atexit then
+  reaper.atexit(release_running_instance)
+end
+
 local ctx = reaper.ImGui_CreateContext(WINDOW_TITLE)
 local font = nil
 local font_size = tonumber(UI_CONFIG.fonts.default.size) or 14
@@ -4185,6 +4276,8 @@ end
 --========================================================
 
 function loop()
+  write_running_instance(false)
+
   initialize_settings_state()
   LibraryStore.initialize_state()
   restore_startup_view_if_needed()
@@ -4219,6 +4312,13 @@ function loop()
         + 90
     end
     reaper.ImGui_SetNextWindowSizeConstraints(ctx, min_window_w, min_window_h, 10000, 10000)
+  end
+
+  if consume_instance_focus_request() then
+    if reaper.ImGui_SetNextWindowFocus then
+      reaper.ImGui_SetNextWindowFocus(ctx)
+    end
+    app.ui.status = "ReaSRTBrowser is already running; focused this window."
   end
 
   local visible, open = reaper.ImGui_Begin(
@@ -4299,8 +4399,8 @@ function loop()
           LibraryPane.draw_list()
         end
       end
+      reaper.ImGui_EndChild(ctx)
     end
-    reaper.ImGui_EndChild(ctx)
 
     reaper.ImGui_SameLine(ctx)
 
@@ -4386,8 +4486,8 @@ function loop()
       )
       if top_visible then
         draw_item_list_pane()
+        reaper.ImGui_EndChild(ctx)
       end
-      reaper.ImGui_EndChild(ctx)
 
       if show_detail_pane then
         if reaper.ImGui_InvisibleButton then
@@ -4448,14 +4548,13 @@ function loop()
         )
         if bottom_visible then
           draw_detail_pane()
+          reaper.ImGui_EndChild(ctx)
         end
-        reaper.ImGui_EndChild(ctx)
       end
+      reaper.ImGui_EndChild(ctx)
     end
-    reaper.ImGui_EndChild(ctx)
+    reaper.ImGui_End(ctx)
   end
-
-  reaper.ImGui_End(ctx)
 
   if font and reaper.ImGui_PopFont then
     reaper.ImGui_PopFont(ctx)
