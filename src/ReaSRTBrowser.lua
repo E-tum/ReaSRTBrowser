@@ -257,10 +257,6 @@ function resolve_available_font_path(path, allow_fallback)
   return nil, preferred ~= ""
 end
 
-function get_effective_font_path(path)
-  return resolve_available_font_path(path, true)
-end
-
 function get_small_font_size_for(size)
   local base_size = tonumber(size) or (tonumber(UI_CONFIG.fonts.default.size) or 14)
   local default_size = tonumber(UI_CONFIG.fonts.default.size) or 14
@@ -418,7 +414,6 @@ local app = {
     filter_tags = "",
     filter_revision = 0,
     offset_input = "0",
-    library_search_open = false,
     left_panel_tab = "sources",
     pending_left_panel_tab = nil,
     content_mode = "source",
@@ -427,6 +422,14 @@ local app = {
     selected_item_keys = {},       -- [item_key] = true
     last_selected_item_key = nil,  -- 最後に選択したアイテム
     selection_anchor_key = nil,    -- Shift範囲選択の起点
+    pending_scroll_to_selected_item = false,
+    pending_scroll_to_item_key = nil,
+    pending_scroll_to_item_pos = nil,
+    item_table_row_height = nil,
+    item_table_measure_last_pos = nil,
+    item_table_measure_last_y = nil,
+    search_history_popup_open = false,
+    tag_suggestions_popup_open = false,
 
     left_pane_width = UI_CONFIG.layout.left_pane_width or 400,
     detail_pane_height = UI_CONFIG.layout.detail_pane_height or 260,
@@ -462,11 +465,16 @@ local app = {
     last_error = nil,
   },
 
+  peak_build = {
+    queue = {},
+    queued_paths = {},
+    current_source = nil,
+    current_path = nil,
+    current_key = nil,
+    steps_per_frame = 8,
+  },
+
   library = {
-    query = "",
-    results = {},
-    status = t("status.library_search_idle"),
-    scanned_files = 0,
     sources = {},
     sources_status = "Source library is idle.",
     sources_dirty = true,
@@ -486,6 +494,8 @@ local app = {
     save_delay_sec = 0.5,
     language = UI_CONFIG.app.default_language,
     recent_sources = {},
+    search_history = {},
+    show_search_history = true,
     last_opened_srt_path = nil,
     last_srt_browse_dir = nil,
     last_audio_browse_dir = nil,
@@ -558,8 +568,6 @@ local move_source_order_entries_before_target
 local move_source_order_entries_after_target
 local refresh_source_library_cache
 local load_source_entry
-local search_library
-local load_library_result
 local prompt_create_library_folder
 local prompt_rename_library_folder
 local invalidate_filter_cache
@@ -585,6 +593,12 @@ local function is_ui_entry_visible(entry)
   end
   if visible_when == "source" then
     return app.ui.content_mode ~= "library"
+  end
+  if visible_when == "search_history_shown" then
+    return app.settings.show_search_history ~= false
+  end
+  if visible_when == "search_history_hidden" then
+    return app.settings.show_search_history == false
   end
   return true
 end
@@ -691,6 +705,31 @@ local function normalize_recent_sources(entries)
       end
     end
     if #result >= 20 then
+      break
+    end
+  end
+
+  return result
+end
+
+local function normalize_search_history(entries)
+  local result = {}
+  local seen = {}
+
+  if type(entries) ~= "table" then
+    return result
+  end
+
+  for _, entry in ipairs(entries) do
+    local query = trim(entry or "")
+    if query ~= "" then
+      local key = normalize_search_text(query)
+      if key ~= "" and not seen[key] then
+        seen[key] = true
+        result[#result + 1] = query
+      end
+    end
+    if #result >= 8 then
       break
     end
   end
@@ -995,6 +1034,7 @@ local function build_settings_payload()
     last_srt_browse_dir = app.settings.last_srt_browse_dir or "",
     last_audio_browse_dir = app.settings.last_audio_browse_dir or "",
     hide_speaker_labels = app.settings.hide_speaker_labels == true,
+    show_search_history = app.settings.show_search_history ~= false,
     preview_volume = tonumber(app.settings.preview_volume) or 90,
     font_path = trim(app.settings.font_path or ""),
     font_size = tonumber(app.settings.font_size) or font_size or tonumber(UI_CONFIG.fonts.default.size) or 14,
@@ -1006,6 +1046,7 @@ local function build_settings_payload()
     detail_pane_height = tonumber(app.ui.detail_pane_height) or UI_CONFIG.layout.detail_pane_height or 260,
     item_table_column_widths = column_widths,
     recent_sources = normalize_recent_sources(app.settings.recent_sources),
+    search_history = normalize_search_history(app.settings.search_history),
     library_folders = folders,
     folder_open_state = normalize_folder_open_state_entries(app.library.folder_open_state, valid_folder_ids),
     source_folders = normalize_source_folder_entries(app.settings.source_folders, valid_folder_ids),
@@ -1016,6 +1057,45 @@ end
 local function mark_settings_dirty()
   app.settings.dirty = true
   app.settings.dirty_at = now_sec()
+end
+
+local function add_search_history_entry(query)
+  query = trim(query or "")
+  if query == "" then
+    return
+  end
+
+  local query_key = normalize_search_text(query)
+  if query_key == "" then
+    return
+  end
+
+  local current = normalize_search_history(app.settings.search_history)
+  local next_history = { query }
+  for _, entry in ipairs(current) do
+    if normalize_search_text(entry) ~= query_key then
+      next_history[#next_history + 1] = entry
+    end
+    if #next_history >= 8 then
+      break
+    end
+  end
+
+  local changed = #next_history ~= #current
+  if not changed then
+    for i, entry in ipairs(next_history) do
+      if current[i] ~= entry then
+        changed = true
+        break
+      end
+    end
+  end
+  if not changed then
+    return
+  end
+
+  app.settings.search_history = next_history
+  mark_settings_dirty()
 end
 
 local function normalize_preview_volume_percent(value)
@@ -1292,8 +1372,6 @@ get_source_order_lookup = library_env.get_source_order_lookup
 move_source_order_entries_before_target = library_env.move_source_order_entries_before_target
 move_source_order_entries_after_target = library_env.move_source_order_entries_after_target
 refresh_source_library_cache = library_env.refresh_source_library_cache
-search_library = library_env.search_library
-load_library_result = library_env.load_library_result
 prompt_create_library_folder = library_env.prompt_create_library_folder
 prompt_rename_library_folder = library_env.prompt_rename_library_folder
 
@@ -1345,10 +1423,12 @@ local function load_settings_json()
       app.settings.loaded = true
       app.settings.language = UI_CONFIG.app.default_language
       app.settings.recent_sources = {}
+      app.settings.search_history = {}
       app.settings.last_opened_srt_path = nil
       app.settings.last_srt_browse_dir = nil
       app.settings.last_audio_browse_dir = nil
       app.settings.hide_speaker_labels = false
+      app.settings.show_search_history = true
       app.settings.preview_volume = 90
       app.settings.font_path = nil
       app.settings.font_size = tonumber(UI_CONFIG.fonts.default.size) or 14
@@ -1376,10 +1456,12 @@ local function load_settings_json()
     app.settings.loaded = true
     app.settings.language = UI_CONFIG.app.default_language
     app.settings.recent_sources = {}
+    app.settings.search_history = {}
     app.settings.last_opened_srt_path = nil
     app.settings.last_srt_browse_dir = nil
     app.settings.last_audio_browse_dir = nil
     app.settings.hide_speaker_labels = false
+    app.settings.show_search_history = true
     app.settings.preview_volume = 90
     app.settings.font_path = nil
     app.settings.font_size = tonumber(UI_CONFIG.fonts.default.size) or 14
@@ -1408,11 +1490,13 @@ local function load_settings_json()
 
   app.settings.language = trim(decoded.language or "") ~= "" and tostring(decoded.language) or UI_CONFIG.app.default_language
   app.settings.recent_sources = normalize_recent_sources(decoded.recent_sources)
+  app.settings.search_history = normalize_search_history(decoded.search_history)
   local last_opened = tostring(decoded.last_opened_srt_path or "")
   app.settings.last_opened_srt_path = last_opened ~= "" and last_opened or nil
   app.settings.last_srt_browse_dir = normalize_browse_dir(decoded.last_srt_browse_dir)
   app.settings.last_audio_browse_dir = normalize_browse_dir(decoded.last_audio_browse_dir)
   app.settings.hide_speaker_labels = decoded.hide_speaker_labels == true
+  app.settings.show_search_history = decoded.show_search_history ~= false
   app.settings.preview_volume = normalize_preview_volume_percent(decoded.preview_volume)
     or normalize_preview_volume_percent(decoded.preview_volume_percent)
     or 90
@@ -1665,13 +1749,7 @@ local function prepare_item_runtime_fields(item)
   item.row_label = table.concat(row_parts, " ")
 
   item.search_blob = normalize_search_text(
-    table.concat({
-      tostring(item.source_name or ""),
-      tostring(item.display_text or item.text or ""),
-      tostring(item.note or ""),
-      tostring(item.tags_text or ""),
-      item.favorite and "favorite" or "",
-    }, "\n")
+    tostring(item.display_text or item.text or "")
   )
 end
 
@@ -1725,15 +1803,6 @@ set_single_selection = function(key)
   if key then
     app.ui.selected_item_keys[key] = true
   end
-  app.ui.last_selected_item_key = key
-  app.ui.selection_anchor_key = key
-end
-
-function add_selection(key)
-  if not key then
-    return
-  end
-  app.ui.selected_item_keys[key] = true
   app.ui.last_selected_item_key = key
   app.ui.selection_anchor_key = key
 end
@@ -1820,17 +1889,6 @@ function select_range_between(anchor_key, target_key, keep_existing)
   app.ui.selection_anchor_key = anchor_key
 end
 
-function get_selected_items_in_filtered_order()
-  local result = {}
-  for _, idx in ipairs(app.cache.filtered_indices) do
-    local item = app.data.items[idx]
-    if item and app.ui.selected_item_keys[item.key] then
-      result[#result + 1] = item
-    end
-  end
-  return result
-end
-
 function get_or_create_insertion_track()
   local track = nil
 
@@ -1873,14 +1931,6 @@ function get_selected_items_in_index_order()
   end
 
   return result
-end
-
-function get_selected_count()
-  local n = 0
-  for _, _ in pairs(app.ui.selected_item_keys) do
-    n = n + 1
-  end
-  return n
 end
 
 function get_last_selected_item()
@@ -1939,6 +1989,115 @@ function ensure_valid_selection()
   end
 end
 
+function has_text_filter_terms(group)
+  return group and (#group.include > 0 or #group.exclude > 0)
+end
+
+function append_text_filter_group(groups, group)
+  if has_text_filter_terms(group) then
+    groups[#groups + 1] = group
+  end
+end
+
+function read_text_filter_token(query, pos)
+  local len = #query
+  local exclude = false
+
+  if query:sub(pos, pos) == "-" then
+    exclude = true
+    pos = pos + 1
+  end
+
+  local token = ""
+  if query:sub(pos, pos) == '"' then
+    pos = pos + 1
+    local parts = {}
+    while pos <= len do
+      local ch = query:sub(pos, pos)
+      if ch == '"' then
+        pos = pos + 1
+        break
+      end
+      parts[#parts + 1] = ch
+      pos = pos + 1
+    end
+    token = table.concat(parts)
+  else
+    local start_pos = pos
+    while pos <= len do
+      local ch = query:sub(pos, pos)
+      if ch:match("%s") or ch == "|" then
+        break
+      end
+      pos = pos + 1
+    end
+    token = query:sub(start_pos, pos - 1)
+  end
+
+  token = normalize_search_text(trim(token))
+  return token, exclude, pos
+end
+
+function parse_text_filter_query(query)
+  query = tostring(query or "")
+  local groups = {}
+  local group = { include = {}, exclude = {} }
+  local pos = 1
+  local len = #query
+
+  while pos <= len do
+    local ch = query:sub(pos, pos)
+    if ch:match("%s") then
+      pos = pos + 1
+    elseif ch == "|" then
+      append_text_filter_group(groups, group)
+      group = { include = {}, exclude = {} }
+      pos = pos + 1
+    else
+      local token, exclude, next_pos = read_text_filter_token(query, pos)
+      if token ~= "" then
+        local target = exclude and group.exclude or group.include
+        target[#target + 1] = token
+      end
+      pos = math.max(next_pos, pos + 1)
+    end
+  end
+
+  append_text_filter_group(groups, group)
+  return groups
+end
+
+function matches_text_filter_query(search_blob, groups)
+  if not groups or #groups == 0 then
+    return true
+  end
+
+  for _, group in ipairs(groups) do
+    local passes = true
+    for _, token in ipairs(group.include) do
+      if not contains_icase_blob(search_blob, token) then
+        passes = false
+        break
+      end
+    end
+
+    if passes then
+      for _, token in ipairs(group.exclude) do
+        if contains_icase_blob(search_blob, token) then
+          passes = false
+          break
+        end
+      end
+    end
+
+    if passes then
+      return true
+    end
+  end
+
+  return false
+end
+
 function rebuild_filtered_cache_if_needed()
   local cache = app.cache
   if cache.filter_revision == app.ui.filter_revision
@@ -1947,7 +2106,7 @@ function rebuild_filtered_cache_if_needed()
   end
 
   local result = {}
-  local needle = normalize_search_text(app.ui.filter_text)
+  local text_filter_groups = parse_text_filter_query(app.ui.filter_text)
   local include_tags = {}
   local exclude_tags = {}
 
@@ -1966,7 +2125,7 @@ function rebuild_filtered_cache_if_needed()
   end
 
   for i, item in ipairs(app.data.items) do
-    local passes = contains_icase_blob(item.search_blob, needle)
+    local passes = matches_text_filter_query(item.search_blob, text_filter_groups)
 
     if passes and app.ui.filter_favorites_only and not item.favorite then
       passes = false
@@ -2030,6 +2189,38 @@ function get_selected_filtered_pos()
   return get_filtered_pos_by_key(app.ui.last_selected_item_key)
 end
 
+local function get_selected_scroll_target_key()
+  local best_key = nil
+  local best_index = nil
+  local best_original_index = nil
+
+  for _, original_index in ipairs(app.cache.filtered_indices or {}) do
+    local item = app.data.items[original_index]
+    if item and app.ui.selected_item_keys[item.key] then
+      local item_index = tonumber(item.srt_index) or tonumber(original_index) or 0
+      if not best_key
+        or item_index < best_index
+        or (item_index == best_index and original_index < best_original_index) then
+        best_key = item.key
+        best_index = item_index
+        best_original_index = original_index
+      end
+    end
+  end
+
+  return best_key
+end
+
+local function resolve_pending_selected_item_scroll()
+  if not app.ui.pending_scroll_to_selected_item then
+    return
+  end
+
+  app.ui.pending_scroll_to_selected_item = false
+  app.ui.pending_scroll_to_item_key = get_selected_scroll_target_key()
+  app.ui.pending_scroll_to_item_pos = get_filtered_pos_by_key(app.ui.pending_scroll_to_item_key)
+end
+
 function select_filtered_pos(pos)
   local filtered_indices = app.cache.filtered_indices
   local idx = filtered_indices[pos]
@@ -2038,28 +2229,6 @@ function select_filtered_pos(pos)
     set_single_selection(item.key)
   else
     clear_selection()
-  end
-end
-
-function select_next_filtered_item()
-  local filtered_indices = app.cache.filtered_indices
-  if #filtered_indices == 0 then
-    app.ui.status = t("status.no_item_to_select")
-    return
-  end
-
-  local pos = get_selected_filtered_pos()
-  if not pos then
-    select_filtered_pos(1)
-    app.ui.status = t("status.selected_first_filtered_item")
-    return
-  end
-
-  if pos < #filtered_indices then
-    select_filtered_pos(pos + 1)
-    app.ui.status = t("status.moved_to_next_filtered_item")
-  else
-    app.ui.status = t("status.already_last_filtered_item")
   end
 end
 
@@ -2449,6 +2618,113 @@ local function set_take_name(take, name)
   reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", tostring(name or ""), true)
 end
 
+function clear_peak_build_current(call_finish)
+  local state = app.peak_build
+  if state.current_source then
+    if call_finish and reaper.PCM_Source_BuildPeaks then
+      pcall(reaper.PCM_Source_BuildPeaks, state.current_source, 2)
+    end
+    pcall(reaper.PCM_Source_Destroy, state.current_source)
+  end
+
+  state.current_source = nil
+  state.current_path = nil
+  state.current_key = nil
+end
+
+function enqueue_peak_build_for_audio(path)
+  if not reaper.PCM_Source_BuildPeaks then
+    return false
+  end
+
+  path = trim(path or "")
+  if path == "" or not file_exists(path) then
+    return false
+  end
+
+  local key = normalize_search_text(path)
+  if key == "" then
+    return false
+  end
+
+  local state = app.peak_build
+  if state.current_key == key or state.queued_paths[key] then
+    return false
+  end
+
+  state.queue[#state.queue + 1] = {
+    path = path,
+    key = key,
+  }
+  state.queued_paths[key] = true
+  return true
+end
+
+function start_next_peak_build()
+  local state = app.peak_build
+  while not state.current_source and #state.queue > 0 do
+    local entry = table.remove(state.queue, 1)
+    if entry then
+      state.queued_paths[entry.key] = nil
+
+      local src = reaper.PCM_Source_CreateFromFile(entry.path)
+      if src then
+        state.current_source = src
+        state.current_path = entry.path
+        state.current_key = entry.key
+
+        local ok, remaining = pcall(reaper.PCM_Source_BuildPeaks, src, 0)
+        if ok and tonumber(remaining) and tonumber(remaining) ~= 0 then
+          return true
+        end
+
+        clear_peak_build_current(false)
+      end
+    end
+  end
+
+  return state.current_source ~= nil
+end
+
+function process_peak_build_queue()
+  if not reaper.PCM_Source_BuildPeaks then
+    return
+  end
+
+  local state = app.peak_build
+  if not state.current_source and not start_next_peak_build() then
+    return
+  end
+
+  local steps = math.max(1, tonumber(state.steps_per_frame) or 8)
+  for _ = 1, steps do
+    if not state.current_source then
+      if not start_next_peak_build() then
+        return
+      end
+    end
+
+    local ok, remaining = pcall(reaper.PCM_Source_BuildPeaks, state.current_source, 1)
+    if not ok then
+      clear_peak_build_current(false)
+      return
+    end
+
+    if (tonumber(remaining) or 0) == 0 then
+      clear_peak_build_current(true)
+      if reaper.UpdateArrange then
+        reaper.UpdateArrange()
+      end
+    end
+  end
+end
+
+function clear_peak_build_queue()
+  clear_peak_build_current(false)
+  app.peak_build.queue = {}
+  app.peak_build.queued_paths = {}
+end
+
 local function insert_item_at_position(item, position_sec, track)
   local ok_validate, info = validate_item_against_audio(item)
   if not ok_validate then
@@ -2488,6 +2764,7 @@ local function insert_item_at_position(item, position_sec, track)
 
   reaper.SetMediaItemTakeInfo_Value(take, "D_STARTOFFS", start_sec)
   set_take_name(take, item.display_text or item.text)
+  enqueue_peak_build_for_audio(info.audio_path)
 
   reaper.UpdateItemInProject(media_item)
 
@@ -2579,6 +2856,55 @@ local function update_selected_favorite(new_value)
   prepare_item_runtime_fields(item)
   invalidate_items()
   app.ui.status = favorite and t("status.favorite_enabled") or t("status.favorite_disabled")
+end
+
+local function set_items_favorite(items, favorite)
+  favorite = favorite == true
+  local changed = 0
+
+  for _, item in ipairs(items or {}) do
+    if item and item.favorite ~= favorite then
+      if app.ui.content_mode == "library" and item.source_metadata_path then
+        local ok, err = LibraryPane.update_item_metadata(item, function(_, meta_item)
+          meta_item.favorite = favorite
+        end)
+        if not ok then
+          app.ui.status = err or t("status.failed_update_favorite")
+          return false
+        end
+      else
+        mark_metadata_dirty()
+      end
+
+      item.favorite = favorite
+      prepare_item_runtime_fields(item)
+      changed = changed + 1
+    end
+  end
+
+  if changed > 0 then
+    invalidate_items()
+  end
+  app.ui.status = favorite and t("status.favorite_enabled") or t("status.favorite_disabled")
+  return true
+end
+
+local function toggle_selected_items_favorite()
+  local items = get_selected_items_in_index_order()
+  if #items == 0 then
+    app.ui.status = t("empty.no_item_selected")
+    return false
+  end
+
+  local should_enable = false
+  for _, item in ipairs(items) do
+    if item and not item.favorite then
+      should_enable = true
+      break
+    end
+  end
+
+  return set_items_favorite(items, should_enable)
 end
 
 local function update_selected_tags_text(new_tags_text)
@@ -2735,10 +3061,6 @@ local function set_hide_speaker_labels_enabled(enabled)
   prepare_all_runtime_fields()
   invalidate_items()
   mark_settings_dirty()
-
-  if app.library.query and app.library.query ~= "" then
-    search_library(app.library.query)
-  end
 
   app.ui.status = enabled
     and t("status.hide_speaker_labels_enabled")
@@ -3284,82 +3606,6 @@ require("reasrt.library_pane")(build_pane_module_env())
 -- UI helpers
 --========================================================
 
-function draw_library_search_section()
-  local header_open = false
-  if reaper.ImGui_CollapsingHeader then
-    header_open = reaper.ImGui_CollapsingHeader(ctx, t("pane.library_search"))
-  else
-    header_open = true
-    reaper.ImGui_Separator(ctx)
-    reaper.ImGui_Text(ctx, t("pane.library_search"))
-  end
-
-  app.ui.library_search_open = header_open
-
-  if not header_open then
-    return
-  end
-
-  reaper.ImGui_SetNextItemWidth(ctx, -120)
-  local changed, new_query = reaper.ImGui_InputTextWithHint(
-    ctx,
-    "##library_query",
-    t("hint.library_query"),
-    app.library.query
-  )
-  if changed then
-    app.library.query = new_query
-  end
-
-  reaper.ImGui_SameLine(ctx)
-  if reaper.ImGui_Button(ctx, t("button.search_library")) then
-    search_library(app.library.query)
-  end
-
-  reaper.ImGui_TextWrapped(ctx, app.library.status)
-
-  if #app.library.results == 0 then
-    return
-  end
-
-  local child_height = 160
-  local child_visible = reaper.ImGui_BeginChild(
-    ctx,
-    "library_results",
-    0,
-    child_height,
-    reaper.ImGui_ChildFlags_None and reaper.ImGui_ChildFlags_None() or 0,
-    reaper.ImGui_WindowFlags_None and reaper.ImGui_WindowFlags_None() or 0
-  )
-  if child_visible then
-    for _, result in ipairs(app.library.results) do
-      local preview_text = tostring(result.display_text or result.text or ""):gsub("[\r\n]+", " ")
-      local label = ("%s | %s | %s"):format(
-        tostring(result.source_name or "(unknown)"),
-        tostring(result.srt_index or "?"),
-        preview_text
-      )
-      if reaper.ImGui_Selectable(ctx, label, false) then
-        load_library_result(result)
-      end
-      if reaper.ImGui_IsItemHovered and reaper.ImGui_IsItemHovered(ctx) and reaper.ImGui_SetTooltip then
-        local tooltip_parts = {
-          t("label.source_path", tostring(result.source_path or "")),
-          t("label.time_range", tostring(result.display_start or ""), tostring(result.display_end or "")),
-        }
-        if result.tags_text and result.tags_text ~= "" then
-          tooltip_parts[#tooltip_parts + 1] = t("label.tags_tooltip", result.tags_text)
-        end
-        if result.note and result.note ~= "" then
-          tooltip_parts[#tooltip_parts + 1] = t("label.note_tooltip", result.note)
-        end
-        reaper.ImGui_SetTooltip(ctx, table.concat(tooltip_parts, "\n"))
-      end
-    end
-    reaper.ImGui_EndChild(ctx)
-  end
-end
-
 function draw_source_summary()
   local srt_summary = t("label.none")
   local audio_summary = t("label.none")
@@ -3530,6 +3776,12 @@ function handle_global_shortcuts()
       end
     end
   end
+
+  if reaper.ImGui_IsKeyPressed and reaper.ImGui_Key_F then
+    if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_F(), false) then
+      toggle_selected_items_favorite()
+    end
+  end
   
   -- Enter / KeypadEnter: insert selected subtitle item at cursor
   local enter_pressed = false
@@ -3572,7 +3824,7 @@ trigger_ui_action = function(action_id)
   elseif action_id == "preview_selected_items" then
     start_preview_selected()
   elseif action_id == "favorite_selected_item" then
-    update_selected_favorite(true)
+    set_items_favorite(get_selected_items_in_index_order(), true)
   elseif action_id == "edit_selected_tags" then
     prompt_edit_selected_tags()
   elseif action_id == "add_speaker_tags" then
@@ -3596,6 +3848,20 @@ trigger_ui_action = function(action_id)
     prompt_set_font_size()
   elseif action_id == "set_font_path" then
     prompt_set_font_path()
+  elseif action_id == "show_search_history" then
+    app.settings.show_search_history = true
+    mark_settings_dirty()
+    app.ui.status = t("status.search_history_shown")
+  elseif action_id == "hide_search_history" then
+    app.settings.show_search_history = false
+    app.ui.search_history_popup_open = false
+    mark_settings_dirty()
+    app.ui.status = t("status.search_history_hidden")
+  elseif action_id == "clear_search_history" then
+    app.settings.search_history = {}
+    app.ui.search_history_popup_open = false
+    mark_settings_dirty()
+    app.ui.status = t("status.search_history_cleared")
   elseif action_id == "set_language_en" then
     set_app_language("en")
     mark_settings_dirty()
@@ -3649,6 +3915,279 @@ function draw_top_bar_actions()
       first_item = false
     end
   end
+end
+
+function begin_window_with_optional_flags(window_id, flags)
+  if not reaper.ImGui_Begin then
+    return false
+  end
+
+  local ok, visible = pcall(reaper.ImGui_Begin, ctx, window_id, true, flags or 0)
+  if ok then
+    return visible
+  end
+  return false
+end
+
+function draw_search_history_popup(should_open, input_hovered, rect_min_x, rect_max_y, rect_w)
+  if not (
+    app.settings.show_search_history ~= false
+    and reaper.ImGui_Begin
+    and reaper.ImGui_End
+    and reaper.ImGui_Selectable
+  ) then
+    app.ui.search_history_popup_open = false
+    return nil
+  end
+
+  local history = normalize_search_history(app.settings.search_history)
+  if #history == 0 then
+    app.ui.search_history_popup_open = false
+    return nil
+  end
+
+  if should_open then
+    app.ui.search_history_popup_open = true
+  end
+  if not app.ui.search_history_popup_open then
+    return nil
+  end
+
+  if rect_min_x and rect_max_y and reaper.ImGui_SetNextWindowPos then
+    pcall(reaper.ImGui_SetNextWindowPos, ctx, rect_min_x, rect_max_y)
+  end
+  if rect_w and rect_w > 0 and reaper.ImGui_SetNextWindowSize then
+    pcall(reaper.ImGui_SetNextWindowSize, ctx, rect_w, 0)
+  end
+
+  local popup_flags = 0
+  if reaper.ImGui_WindowFlags_NoTitleBar then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoTitleBar()
+  end
+  if reaper.ImGui_WindowFlags_NoResize then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoResize()
+  end
+  if reaper.ImGui_WindowFlags_NoMove then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoMove()
+  end
+  if reaper.ImGui_WindowFlags_NoSavedSettings then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoSavedSettings()
+  end
+  if reaper.ImGui_WindowFlags_NoFocusOnAppearing then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoFocusOnAppearing()
+  end
+  if reaper.ImGui_WindowFlags_NoNavFocus then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoNavFocus()
+  end
+
+  local selected_query = nil
+  local window_hovered = false
+  if begin_window_with_optional_flags("##filter_search_history_window", popup_flags) then
+    if reaper.ImGui_IsWindowHovered then
+      window_hovered = reaper.ImGui_IsWindowHovered(ctx)
+    end
+    for _, query in ipairs(history) do
+      if reaper.ImGui_Selectable(ctx, query, false) then
+        selected_query = query
+        app.ui.search_history_popup_open = false
+      end
+    end
+    reaper.ImGui_End(ctx)
+  end
+
+  local clicked_outside = false
+  if reaper.ImGui_IsMouseClicked then
+    clicked_outside = reaper.ImGui_IsMouseClicked(ctx, 0)
+      or reaper.ImGui_IsMouseClicked(ctx, 1)
+      or reaper.ImGui_IsMouseClicked(ctx, 2)
+  end
+  if clicked_outside
+    and not input_hovered
+    and not window_hovered then
+    app.ui.search_history_popup_open = false
+  end
+
+  return selected_query
+end
+
+function get_tag_filter_token(query)
+  query = tostring(query or "")
+  local token_start, token_end, token = nil, nil, ""
+  for start_pos, value, end_pos in query:gmatch("()(%S+)()") do
+    token_start = start_pos
+    token_end = end_pos
+    token = value
+  end
+
+  if token_start and token_end == #query + 1 then
+    return token, token_start, token_end
+  end
+
+  return "", #query + 1, #query + 1
+end
+
+function build_tag_filter_with_selected_suggestion(query, tag)
+  query = tostring(query or "")
+  tag = normalize_tag(tag)
+  if tag == "" then
+    return query
+  end
+
+  local token, token_start, token_end = get_tag_filter_token(query)
+  local is_exclude = token:sub(1, 1) == "-"
+  local replacement = is_exclude and ("-" .. tag) or tag
+  local prefix = query:sub(1, math.max(0, (token_start or 1) - 1))
+  local suffix = query:sub(token_end or (#query + 1))
+  local next_query = prefix .. replacement .. suffix
+  return trim(next_query)
+end
+
+function apply_selected_tag_suggestion(tag)
+  tag = normalize_tag(tag)
+  if tag == "" then
+    return false
+  end
+
+  app.ui.filter_tags = build_tag_filter_with_selected_suggestion(app.ui.filter_tags, tag)
+  app.ui.tag_suggestions_popup_open = false
+  invalidate_filter_cache()
+  app.ui.status = t("status.filter_tags_updated")
+  return true
+end
+
+function get_tag_suggestions(query)
+  local token = get_tag_filter_token(query)
+  if token:sub(1, 1) == "-" then
+    token = token:sub(2)
+  end
+  local needle = normalize_search_text(normalize_tag(token))
+  local counts = {}
+  local display_names = {}
+
+  for _, item in ipairs(app.data.items or {}) do
+    local seen = {}
+    local tags = item.tags or parse_tags_text(item.tags_text)
+    for _, tag in ipairs(tags or {}) do
+      tag = normalize_tag(tag)
+      local key = normalize_search_text(tag)
+      if key ~= "" and not seen[key] then
+        seen[key] = true
+        if needle == "" or key:find(needle, 1, true) then
+          counts[key] = (counts[key] or 0) + 1
+          display_names[key] = display_names[key] or tag
+        end
+      end
+    end
+  end
+
+  local suggestions = {}
+  for key, count in pairs(counts) do
+    suggestions[#suggestions + 1] = {
+      key = key,
+      tag = display_names[key] or key,
+      count = count,
+    }
+  end
+  table.sort(suggestions, function(a, b)
+    if a.count ~= b.count then
+      return a.count > b.count
+    end
+    return compare_text_case_insensitive(a.tag, b.tag)
+  end)
+
+  while #suggestions > 8 do
+    suggestions[#suggestions] = nil
+  end
+
+  return suggestions
+end
+
+function draw_tag_suggestions_popup(should_open, input_active, input_hovered, rect_min_x, rect_max_y, rect_w)
+  if not (reaper.ImGui_Begin and reaper.ImGui_End and reaper.ImGui_Selectable) then
+    app.ui.tag_suggestions_popup_open = false
+    return nil
+  end
+
+  local suggestions = get_tag_suggestions(app.ui.filter_tags)
+  if #suggestions == 0 then
+    app.ui.tag_suggestions_popup_open = false
+    return nil
+  end
+
+  if should_open then
+    app.ui.tag_suggestions_popup_open = true
+  end
+  if not app.ui.tag_suggestions_popup_open then
+    return nil
+  end
+
+  if rect_min_x and rect_max_y and reaper.ImGui_SetNextWindowPos then
+    pcall(reaper.ImGui_SetNextWindowPos, ctx, rect_min_x, rect_max_y)
+  end
+  if rect_w and rect_w > 0 and reaper.ImGui_SetNextWindowSize then
+    pcall(reaper.ImGui_SetNextWindowSize, ctx, rect_w, 0)
+  end
+
+  local popup_flags = 0
+  if reaper.ImGui_WindowFlags_NoTitleBar then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoTitleBar()
+  end
+  if reaper.ImGui_WindowFlags_NoResize then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoResize()
+  end
+  if reaper.ImGui_WindowFlags_NoMove then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoMove()
+  end
+  if reaper.ImGui_WindowFlags_NoSavedSettings then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoSavedSettings()
+  end
+  if reaper.ImGui_WindowFlags_NoFocusOnAppearing then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoFocusOnAppearing()
+  end
+  if reaper.ImGui_WindowFlags_NoNavFocus then
+    popup_flags = popup_flags | reaper.ImGui_WindowFlags_NoNavFocus()
+  end
+
+  local selected_tag = nil
+  local window_hovered = false
+  if begin_window_with_optional_flags("##filter_tag_suggestions_window", popup_flags) then
+    if reaper.ImGui_IsWindowHovered then
+      window_hovered = reaper.ImGui_IsWindowHovered(ctx)
+    end
+    for _, suggestion in ipairs(suggestions) do
+      local label = string.format("%s (%d)##tag_suggestion_%s", suggestion.tag, suggestion.count, suggestion.key)
+      local selected = reaper.ImGui_Selectable(ctx, label, false)
+      if not selected and reaper.ImGui_IsItemClicked then
+        selected = reaper.ImGui_IsItemClicked(ctx, 0)
+      end
+      if selected then
+        selected_tag = suggestion.tag
+        app.ui.tag_suggestions_popup_open = false
+      end
+    end
+    reaper.ImGui_End(ctx)
+  end
+
+  if selected_tag then
+    return selected_tag
+  end
+
+  local clicked_outside = false
+  if reaper.ImGui_IsMouseClicked then
+    clicked_outside = reaper.ImGui_IsMouseClicked(ctx, 0)
+      or reaper.ImGui_IsMouseClicked(ctx, 1)
+      or reaper.ImGui_IsMouseClicked(ctx, 2)
+  end
+  if clicked_outside
+    and not input_hovered
+    and not window_hovered then
+    app.ui.tag_suggestions_popup_open = false
+  end
+  if not input_active and not window_hovered then
+    app.ui.tag_suggestions_popup_open = false
+  end
+
+  return selected_tag
 end
 
 function draw_toggle_button(label, enabled)
@@ -3732,27 +4271,125 @@ function draw_top_bar()
 
   reaper.ImGui_SameLine(ctx)
   reaper.ImGui_SetNextItemWidth(ctx, 220)
+  local previous_filter_tags = tostring(app.ui.filter_tags or "")
   local tags_changed, new_filter_tags = reaper.ImGui_InputTextWithHint(
     ctx,
     "##filter_tags",
     t("hint.filter_tags"),
     app.ui.filter_tags
   )
+  local tag_input_active = false
+  if reaper.ImGui_IsItemActive then
+    tag_input_active = reaper.ImGui_IsItemActive(ctx)
+  end
+  if reaper.ImGui_IsItemFocused then
+    tag_input_active = tag_input_active or reaper.ImGui_IsItemFocused(ctx)
+  end
+  local tag_input_hovered = reaper.ImGui_IsItemHovered and reaper.ImGui_IsItemHovered(ctx)
+  local tag_input_clicked = false
+  if reaper.ImGui_IsItemClicked then
+    tag_input_clicked = reaper.ImGui_IsItemClicked(ctx, 0)
+  elseif tag_input_hovered and reaper.ImGui_IsMouseClicked then
+    tag_input_clicked = reaper.ImGui_IsMouseClicked(ctx, 0)
+  end
+  local tag_rect_min_x = nil
+  local tag_rect_max_x, tag_rect_max_y = nil, nil
+  if reaper.ImGui_GetItemRectMin and reaper.ImGui_GetItemRectMax then
+    tag_rect_min_x = reaper.ImGui_GetItemRectMin(ctx)
+    tag_rect_max_x, tag_rect_max_y = reaper.ImGui_GetItemRectMax(ctx)
+  end
+  local tag_filter_cleared_by_edit = false
   if tags_changed then
+    tag_filter_cleared_by_edit = trim(previous_filter_tags) ~= "" and trim(new_filter_tags or "") == ""
+    if tag_filter_cleared_by_edit then
+      app.ui.pending_scroll_to_selected_item = true
+      app.ui.pending_scroll_to_item_key = nil
+      app.ui.pending_scroll_to_item_pos = nil
+      app.ui.tag_suggestions_popup_open = false
+    end
     app.ui.filter_tags = new_filter_tags
     invalidate_filter_cache()
     app.ui.status = t("status.filter_tags_updated")
   end
+  local picked_tag = draw_tag_suggestions_popup(
+    tag_input_clicked and tag_input_active and not tag_filter_cleared_by_edit,
+    tag_input_active,
+    tag_input_hovered,
+    tag_rect_min_x,
+    tag_rect_max_y,
+    tag_rect_min_x and tag_rect_max_x and (tag_rect_max_x - tag_rect_min_x) or nil
+  )
+  if picked_tag and picked_tag ~= "" then
+    apply_selected_tag_suggestion(picked_tag)
+  end
 
   reaper.ImGui_SetNextItemWidth(ctx, -1)
+  local previous_filter = tostring(app.ui.filter_text or "")
   local changed, new_filter = reaper.ImGui_InputTextWithHint(
     ctx,
     "##filter",
     t("hint.search_items"),
     app.ui.filter_text
   )
+  local filter_input_active = false
+  if reaper.ImGui_IsItemActive then
+    filter_input_active = reaper.ImGui_IsItemActive(ctx)
+  end
+  if reaper.ImGui_IsItemFocused then
+    filter_input_active = filter_input_active or reaper.ImGui_IsItemFocused(ctx)
+  end
+  local filter_input_hovered = reaper.ImGui_IsItemHovered and reaper.ImGui_IsItemHovered(ctx)
+  local filter_input_clicked = false
+  if reaper.ImGui_IsItemClicked then
+    filter_input_clicked = reaper.ImGui_IsItemClicked(ctx, 0)
+  elseif filter_input_hovered and reaper.ImGui_IsMouseClicked then
+    filter_input_clicked = reaper.ImGui_IsMouseClicked(ctx, 0)
+  end
+  local filter_deactivated_after_edit = reaper.ImGui_IsItemDeactivatedAfterEdit
+    and reaper.ImGui_IsItemDeactivatedAfterEdit(ctx)
+
+  local rect_min_x = nil
+  local rect_max_x, rect_max_y = nil, nil
+  if reaper.ImGui_GetItemRectMin and reaper.ImGui_GetItemRectMax then
+    rect_min_x = reaper.ImGui_GetItemRectMin(ctx)
+    rect_max_x, rect_max_y = reaper.ImGui_GetItemRectMax(ctx)
+  end
+
+  local filter_cleared_by_edit = false
   if changed then
+    filter_cleared_by_edit = trim(previous_filter) ~= "" and trim(new_filter or "") == ""
+    if filter_cleared_by_edit then
+      add_search_history_entry(previous_filter)
+      app.ui.pending_scroll_to_selected_item = true
+      app.ui.pending_scroll_to_item_key = nil
+      app.ui.pending_scroll_to_item_pos = nil
+      app.ui.search_history_popup_open = false
+    end
     app.ui.filter_text = new_filter
+    if trim(new_filter or "") ~= "" then
+      app.ui.search_history_popup_open = false
+    end
+    invalidate_filter_cache()
+    app.ui.status = t("status.filter_updated")
+  end
+  if filter_deactivated_after_edit then
+    add_search_history_entry(app.ui.filter_text)
+  end
+
+  local picked_history = draw_search_history_popup(
+    filter_input_clicked
+      and filter_input_active
+      and trim(previous_filter) == ""
+      and not changed
+      and not filter_cleared_by_edit,
+    filter_input_hovered,
+    rect_min_x,
+    rect_max_y,
+    rect_min_x and rect_max_x and (rect_max_x - rect_min_x) or nil
+  )
+  if picked_history and picked_history ~= "" then
+    app.ui.filter_text = picked_history
+    add_search_history_entry(picked_history)
     invalidate_filter_cache()
     app.ui.status = t("status.filter_updated")
   end
@@ -3859,7 +4496,7 @@ function draw_item_context_menu(item, popup_id)
       start_preview_selected()
     end
     if reaper.ImGui_MenuItem(ctx, t("menu.favorite_selected_item")) then
-      update_selected_favorite(true)
+      set_items_favorite(get_selected_items_in_index_order(), true)
     end
     if reaper.ImGui_MenuItem(ctx, t("menu.edit_selected_tags")) then
       prompt_edit_selected_tags()
@@ -3867,6 +4504,73 @@ function draw_item_context_menu(item, popup_id)
 
     reaper.ImGui_EndPopup(ctx)
   end
+end
+
+function clear_pending_item_scroll()
+  app.ui.pending_scroll_to_item_key = nil
+  app.ui.pending_scroll_to_item_pos = nil
+end
+
+function get_text_line_height_with_spacing()
+  if reaper.ImGui_GetTextLineHeightWithSpacing then
+    local ok, height = pcall(reaper.ImGui_GetTextLineHeightWithSpacing, ctx)
+    if ok and tonumber(height) and tonumber(height) > 0 then
+      return tonumber(height)
+    end
+  end
+
+  return math.max(font_size or 14, font_small_size or 12) + 4
+end
+
+function get_item_table_scroll_row_height()
+  local measured = tonumber(app.ui.item_table_row_height)
+  if measured and measured > 0 then
+    return measured
+  end
+
+  return get_text_line_height_with_spacing()
+end
+
+function reset_item_table_row_measurement()
+  app.ui.item_table_measure_last_pos = nil
+  app.ui.item_table_measure_last_y = nil
+end
+
+function measure_item_table_row_height(filtered_pos)
+  if not (filtered_pos and reaper.ImGui_GetCursorScreenPos) then
+    return
+  end
+
+  local _, y = reaper.ImGui_GetCursorScreenPos(ctx)
+  filtered_pos = tonumber(filtered_pos)
+  y = tonumber(y)
+  if not (filtered_pos and y) then
+    return
+  end
+
+  local last_pos = tonumber(app.ui.item_table_measure_last_pos)
+  local last_y = tonumber(app.ui.item_table_measure_last_y)
+  if last_pos and last_y and filtered_pos == last_pos + 1 then
+    local row_height = y - last_y
+    local text_height = get_text_line_height_with_spacing()
+    if row_height > text_height * 0.75 and row_height < text_height * 3.0 then
+      app.ui.item_table_row_height = row_height
+    end
+  end
+
+  app.ui.item_table_measure_last_pos = filtered_pos
+  app.ui.item_table_measure_last_y = y
+end
+
+function maybe_scroll_to_pending_item(item)
+  if not item or app.ui.pending_scroll_to_item_key ~= item.key then
+    return
+  end
+
+  if reaper.ImGui_SetScrollHereY then
+    reaper.ImGui_SetScrollHereY(ctx, 0.5)
+  end
+  clear_pending_item_scroll()
 end
 
 function draw_list_row_fallback(original_index)
@@ -3880,6 +4584,7 @@ function draw_list_row_fallback(original_index)
   if reaper.ImGui_Selectable(ctx, item.row_label, selected) then
     handle_item_selection_interaction(item)
   end
+  maybe_scroll_to_pending_item(item)
 
   if reaper.ImGui_IsItemHovered(ctx) and reaper.ImGui_IsMouseDoubleClicked(ctx, 0) then
     insert_selected_items_at_cursor()
@@ -3929,13 +4634,19 @@ function setup_item_table_columns()
     local saved_widths = app.settings.item_table_column_widths and app.settings.item_table_column_widths[mode_name] or nil
 
     for _, column in ipairs(columns) do
-      local flags = column.width_mode == "stretch" and stretch or fixed
+      local is_stretch = column.width_mode == "stretch"
+      local flags = is_stretch and stretch or fixed
       if column.no_hide then
         flags = flags | no_hide
       end
       local width = tonumber(column.width) or 0.0
       if saved_widths and tonumber(saved_widths[column.key]) then
         width = tonumber(saved_widths[column.key]) or width
+      end
+      if is_stretch then
+        width = math.max(0.01, width)
+      else
+        width = math.max(1.0, width)
       end
       reaper.ImGui_TableSetupColumn(ctx, t(column.key), flags, width)
     end
@@ -3998,7 +4709,7 @@ function draw_item_table_header()
   end
 end
 
-function draw_item_table_row(original_index)
+function draw_item_table_row(original_index, filtered_pos)
   local item = app.data.items[original_index]
   if not item then
     return
@@ -4014,9 +4725,10 @@ function draw_item_table_row(original_index)
   end
 
   reaper.ImGui_TableNextRow(ctx)
+  reaper.ImGui_TableSetColumnIndex(ctx, 0)
+  measure_item_table_row_height(filtered_pos)
 
   if app.ui.content_mode == "library" then
-    reaper.ImGui_TableSetColumnIndex(ctx, 0)
     reaper.ImGui_Text(ctx, tostring(item.source_name or ""))
   end
 
@@ -4059,11 +4771,14 @@ function draw_item_table_row(original_index)
 
   reaper.ImGui_TableSetColumnIndex(ctx, app.ui.content_mode == "library" and 6 or 5)
   reaper.ImGui_Text(ctx, tostring(item.tags_text or ""))
+
+  maybe_scroll_to_pending_item(item)
 end
 
 function draw_item_list_pane()
   rebuild_filtered_cache_if_needed()
   local filtered_indices = app.cache.filtered_indices
+  resolve_pending_selected_item_scroll()
 
   reaper.ImGui_Text(ctx, t("pane.item_list"))
   reaper.ImGui_SameLine(ctx)
@@ -4104,6 +4819,7 @@ function draw_item_list_pane()
     for _, original_index in ipairs(filtered_indices) do
       draw_list_row_fallback(original_index)
     end
+    clear_pending_item_scroll()
     return
   end
 
@@ -4118,8 +4834,15 @@ function draw_item_list_pane()
   if reaper.ImGui_BeginTable(ctx, table_id, app.ui.content_mode == "library" and 7 or 6, table_flags, outer_size_w, outer_size_h) then
     setup_item_table_columns()
     draw_item_table_header()
+    reset_item_table_row_measurement()
     local clipped = false
-    if reaper.ImGui_ListClipper_Begin
+    local pending_scroll_pos = tonumber(app.ui.pending_scroll_to_item_pos)
+    local allow_clipper = app.ui.pending_scroll_to_item_key == nil
+      or (pending_scroll_pos ~= nil
+        and reaper.ImGui_ListClipper_IncludeItemByIndex
+        and reaper.ImGui_SetScrollHereY)
+    if allow_clipper
+      and reaper.ImGui_ListClipper_Begin
       and reaper.ImGui_ListClipper_Step
       and reaper.ImGui_ListClipper_End
       and reaper.ImGui_ListClipper_GetDisplayRange then
@@ -4139,7 +4862,20 @@ function draw_item_list_pane()
         if not clipper then
           return
         end
-        reaper.ImGui_ListClipper_Begin(clipper, #filtered_indices)
+        local row_height = get_item_table_scroll_row_height()
+        local began = false
+        if row_height and row_height > 0 then
+          began = pcall(reaper.ImGui_ListClipper_Begin, clipper, #filtered_indices, row_height)
+        end
+        if not began then
+          reaper.ImGui_ListClipper_Begin(clipper, #filtered_indices)
+        end
+        if pending_scroll_pos
+          and pending_scroll_pos >= 1
+          and pending_scroll_pos <= #filtered_indices
+          and reaper.ImGui_ListClipper_IncludeItemByIndex then
+          pcall(reaper.ImGui_ListClipper_IncludeItemByIndex, clipper, pending_scroll_pos - 1)
+        end
         while reaper.ImGui_ListClipper_Step(clipper) do
           local display_start, display_end = reaper.ImGui_ListClipper_GetDisplayRange(clipper)
           display_start = tonumber(display_start) or 0
@@ -4147,7 +4883,7 @@ function draw_item_list_pane()
           for pos = display_start + 1, display_end do
             local original_index = filtered_indices[pos]
             if original_index then
-              draw_item_table_row(original_index)
+              draw_item_table_row(original_index, pos)
             end
           end
         end
@@ -4160,9 +4896,12 @@ function draw_item_list_pane()
     end
 
     if not clipped then
-      for _, original_index in ipairs(filtered_indices) do
-        draw_item_table_row(original_index)
+      for pos, original_index in ipairs(filtered_indices) do
+        draw_item_table_row(original_index, pos)
       end
+    end
+    if not allow_clipper then
+      clear_pending_item_scroll()
     end
 
     if reaper.ImGui_TableGetColumnWidth then
@@ -4286,6 +5025,7 @@ function loop()
   flush_settings_if_needed(false)
   LibraryStore.flush_if_needed(false)
   update_preview_playback()
+  process_peak_build_queue()
   refresh_source_library_cache()
 
   if font and reaper.ImGui_PushFont then
@@ -4564,6 +5304,7 @@ function loop()
     reaper.defer(loop)
   else
     stop_preview(true)
+    clear_peak_build_queue()
     flush_metadata_if_needed(true)
     flush_settings_if_needed(true)
     LibraryStore.flush_if_needed(true)

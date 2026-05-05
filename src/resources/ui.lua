@@ -94,6 +94,14 @@ return {
             { action = "set_language_ja", label = "menu.language_ja" },
           },
         },
+        {
+          label = "menu.search",
+          items = {
+            { action = "hide_search_history", label = "menu.hide_search_history", visible_when = "search_history_shown" },
+            { action = "show_search_history", label = "menu.show_search_history", visible_when = "search_history_hidden" },
+            { action = "clear_search_history", label = "menu.clear_search_history" },
+          },
+        },
       },
     },
   },
@@ -105,7 +113,7 @@ return {
       { key = "item.column.start", width_mode = "fixed", width = 90.0, no_hide = true },
       { key = "item.column.end", width_mode = "fixed", width = 90.0, no_hide = true },
       { key = "item.column.favorite_short", width_mode = "fixed", width = 45.0, no_hide = true },
-      { key = "item.column.tags", width_mode = "stretch", width = 0.0, no_hide = false },
+      { key = "item.column.tags", width_mode = "stretch", width = 0.25, no_hide = false },
     },
     library = {
       { key = "item.column.srt", width_mode = "fixed", width = 160.0, no_hide = true },
@@ -114,7 +122,7 @@ return {
       { key = "item.column.start", width_mode = "fixed", width = 90.0, no_hide = true },
       { key = "item.column.end", width_mode = "fixed", width = 90.0, no_hide = true },
       { key = "item.column.favorite_short", width_mode = "fixed", width = 45.0, no_hide = true },
-      { key = "item.column.tags", width_mode = "stretch", width = 0.0, no_hide = false },
+      { key = "item.column.tags", width_mode = "stretch", width = 0.25, no_hide = false },
     },
   },
 }
