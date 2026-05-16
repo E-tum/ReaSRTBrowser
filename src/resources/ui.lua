@@ -21,7 +21,7 @@ return {
   layout = {
     left_pane_width = 400,
     detail_pane_height = 130,
-    max_detail_height = 160,
+    max_detail_height = 360,
     min_source_width = 120,
     min_main_width = 420,
     splitter_width = 6,
@@ -68,6 +68,7 @@ return {
         { action = "preview_selected_items", label = "menu.preview_selected_items" },
         { action = "favorite_selected_item", label = "menu.favorite_selected_item" },
         { action = "edit_selected_tags", label = "menu.edit_selected_tags" },
+        { action = "remove_audio_binding", label = "menu.remove_audio_binding" },
         { type = "separator" },
         { action = "add_speaker_tags", label = "menu.add_speaker_tags", visible_when = "source" },
         { type = "separator", visible_when = "source" },

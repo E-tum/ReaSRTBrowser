@@ -390,6 +390,7 @@ local app = {
     audio_loaded = false,
     audio_length_sec = nil,
     audio_files = {},
+    selected_audio_path = nil,
     audio_missing = false,
     audio_missing_path = nil,
 
@@ -534,6 +535,7 @@ local app = {
 
 local load_srt_from_path
 local load_audio_from_path
+local select_audio_by_path
 local clear_source_selection
 local clear_selection
 local set_single_source_selection
@@ -615,6 +617,38 @@ end
 -- Metadata helpers
 --========================================================
 
+local SUPPORTED_AUDIO_EXTENSIONS = {
+  "wav",
+  "flac",
+  "mp3",
+  "aif",
+  "aiff",
+  "ogg",
+  "mp4",
+}
+
+local SUPPORTED_AUDIO_EXTENSIONS_LOOKUP = {}
+for _, ext in ipairs(SUPPORTED_AUDIO_EXTENSIONS) do
+  SUPPORTED_AUDIO_EXTENSIONS_LOOKUP[ext] = true
+end
+
+function get_supported_audio_extension_filter()
+  return table.concat(SUPPORTED_AUDIO_EXTENSIONS, ";")
+end
+
+function get_supported_audio_dialog_filter()
+  local patterns = {}
+  for _, ext in ipairs(SUPPORTED_AUDIO_EXTENSIONS) do
+    patterns[#patterns + 1] = "*." .. ext
+  end
+  return "Audio/Video files|" .. table.concat(patterns, ";") .. "|All files|*.*"
+end
+
+function is_supported_audio_file_path(path)
+  local ext = tostring(path or ""):match("%.([^%.\\/]+)$")
+  return ext ~= nil and SUPPORTED_AUDIO_EXTENSIONS_LOOKUP[normalize_search_text(ext)] == true
+end
+
 local function make_item_lookup_key(srt_index, start_ms, end_ms, text_value)
   return table.concat({
     tostring(srt_index or ""),
@@ -646,6 +680,7 @@ end
 
 local function copy_audio_file_entries(entries)
   local result = {}
+  local seen = {}
 
   if type(entries) ~= "table" then
     return result
@@ -654,17 +689,69 @@ local function copy_audio_file_entries(entries)
   for _, entry in ipairs(entries) do
     if type(entry) == "table" then
       local path = tostring(entry.path or "")
-      if path ~= "" then
+      local key = normalize_search_text(path)
+      if path ~= "" and not seen[key] then
+        seen[key] = true
         result[#result + 1] = {
           path = path,
           label = tostring(entry.label or ""),
           is_primary = entry.is_primary == true,
+          offset_ms = entry.offset_ms ~= nil and (parse_integer(entry.offset_ms, 0) or 0) or nil,
+          length_sec = tonumber(entry.length_sec),
         }
       end
     end
   end
 
   return result
+end
+
+function get_audio_entry_display_name(entry)
+  if not entry then
+    return t("label.none")
+  end
+  local label = trim(entry.label or "")
+  if label ~= "" and label ~= "primary" then
+    return label
+  end
+  local path = tostring(entry.path or "")
+  return get_filename(path) or path
+end
+
+function find_audio_entry_index(entries, path)
+  path = tostring(path or "")
+  local key = normalize_search_text(path)
+  if key == "" then
+    return nil
+  end
+
+  for index, entry in ipairs(entries or {}) do
+    if normalize_search_text(entry and entry.path or "") == key then
+      return index
+    end
+  end
+
+  return nil
+end
+
+function get_selected_audio_entry(entries, selected_path)
+  entries = entries or {}
+  if #entries == 0 then
+    return nil, nil
+  end
+
+  local index = find_audio_entry_index(entries, selected_path)
+  if not index then
+    for i, entry in ipairs(entries) do
+      if entry and entry.is_primary == true then
+        index = i
+        break
+      end
+    end
+  end
+  index = index or 1
+
+  return entries[index], index
 end
 
 local function get_primary_audio_file_entry(entries)
@@ -1305,6 +1392,11 @@ function build_library_env()
     json_decode = json_decode,
     copy_audio_file_entries = copy_audio_file_entries,
     get_primary_audio_file_entry = get_primary_audio_file_entry,
+    get_selected_audio_entry = get_selected_audio_entry,
+    find_audio_entry_index = find_audio_entry_index,
+    get_audio_entry_display_name = get_audio_entry_display_name,
+    is_supported_audio_file_path = is_supported_audio_file_path,
+    get_supported_audio_extension_filter = get_supported_audio_extension_filter,
     file_exists = file_exists,
     get_filename = get_filename,
     parse_integer = parse_integer,
@@ -1392,6 +1484,12 @@ function build_library_logic_env()
     refresh_source_library_cache = refresh_source_library_cache,
     copy_audio_file_entries = copy_audio_file_entries,
     get_primary_audio_file_entry = get_primary_audio_file_entry,
+    get_selected_audio_entry = get_selected_audio_entry,
+    find_audio_entry_index = find_audio_entry_index,
+    get_audio_entry_display_name = get_audio_entry_display_name,
+    is_supported_audio_file_path = is_supported_audio_file_path,
+    get_supported_audio_extension_filter = get_supported_audio_extension_filter,
+    normalize_search_text = normalize_search_text,
     parse_integer = parse_integer,
     parse_tags_text = parse_tags_text,
     join_tags = join_tags,
@@ -2250,6 +2348,11 @@ function build_source_env()
     make_item_lookup_key = make_item_lookup_key,
     copy_audio_file_entries = copy_audio_file_entries,
     get_primary_audio_file_entry = get_primary_audio_file_entry,
+    get_selected_audio_entry = get_selected_audio_entry,
+    find_audio_entry_index = find_audio_entry_index,
+    get_audio_entry_display_name = get_audio_entry_display_name,
+    is_supported_audio_file_path = is_supported_audio_file_path,
+    get_supported_audio_extension_filter = get_supported_audio_extension_filter,
     file_exists = file_exists,
     get_media_length_sec = get_media_length_sec,
     get_filename = get_filename,
@@ -2306,9 +2409,10 @@ save_metadata_json = source_env.save_metadata_json
 flush_metadata_now = source_env.flush_metadata_now
 load_srt_from_path = source_env.load_srt_from_path
 load_audio_from_path = source_env.load_audio_from_path
+select_audio_by_path = source_env.select_audio_by_path
 load_source_entry = source_env.load_source_entry
 
-local function flush_metadata_if_needed(force)
+function flush_metadata_if_needed(force)
   if not app.data.metadata_dirty then
     return
   end
@@ -2325,7 +2429,7 @@ end
 -- Source loading
 --========================================================
 
-local function prompt_add_srt()
+function prompt_add_srt()
   local paths, multi_err = prompt_select_multiple_srt_paths_windows()
   if paths ~= nil then
     if #paths == 0 then
@@ -2351,37 +2455,123 @@ local function prompt_add_srt()
   add_srt_paths_to_library({ path })
 end
 
-local function prompt_open_audio()
-  local initial_dir = get_dialog_browse_dir("audio")
-  local retval, path = reaper.GetUserFileNameForRead(
-    initial_dir,
-    t("prompt.open_audio_title"),
-    "wav;flac;mp3;aif;aiff;ogg"
-  )
-  if not retval or not path or path == "" then
-    app.ui.status = t("status.audio_load_canceled")
-    return
+function prompt_select_audio_path()
+  local selected = false
+  local path = nil
+  local dialog_err = nil
+
+  if prompt_select_audio_path_windows and reaper.ExecProcess then
+    path, dialog_err = prompt_select_audio_path_windows()
+    selected = path ~= nil and path ~= ""
+  elseif reaper.GetUserFileName then
+    local initial_dir = get_dialog_browse_dir("audio") or ""
+    selected, path = reaper.GetUserFileName(
+      1,
+      t("prompt.open_audio_title"),
+      initial_dir,
+      get_supported_audio_dialog_filter()
+    )
+    if not selected then
+      path = nil
+    end
+  elseif reaper.GetUserFileNameForRead then
+    local initial_dir = get_dialog_browse_dir("audio")
+    selected, path = reaper.GetUserFileNameForRead(initial_dir, t("prompt.open_audio_title"), "wav")
+    if not selected then
+      path = nil
+    end
+  else
+    dialog_err = t("status.file_dialog_unavailable")
   end
 
-  remember_browse_file_path("audio", path)
+  if not selected or not path or path == "" then
+    return nil, dialog_err or t("status.audio_load_canceled")
+  end
+
+  return path
+end
+
+function prompt_open_audio()
   if app.ui.content_mode == "library" then
     local item = get_last_selected_item()
     if not item or not item.source_metadata_path then
       app.ui.status = t("status.no_library_item_selected")
       return
     end
-    LibraryPane.bind_audio_to_item(item, path)
+  end
+
+  local path, dialog_err = prompt_select_audio_path()
+  if not path or path == "" then
+    app.ui.status = dialog_err or t("status.audio_load_canceled")
     return
   end
 
-  load_audio_from_path(path)
+  remember_browse_file_path("audio", path)
+  if app.ui.content_mode == "library" then
+    local item = get_last_selected_item()
+    LibraryPane.add_audio_to_item_source(item, path)
+    return
+  end
+
+  local ok, message = load_audio_from_path(path)
+  if not ok then
+    app.ui.status = message or t("status.failed_bind_audio")
+  end
+end
+
+function remove_selected_audio_binding()
+  if app.ui.content_mode == "library" then
+    local item = get_last_selected_item()
+    return LibraryPane.remove_selected_audio_from_item_source(item)
+  end
+
+  local remove_path = tostring(app.source.selected_audio_path or app.source.audio_path or "")
+  if remove_path == "" then
+    app.ui.status = t("status.no_audio_file_bound")
+    return false
+  end
+
+  local audio_files = copy_audio_file_entries(app.source.audio_files)
+  local remove_index = find_audio_entry_index(audio_files, remove_path)
+  if not remove_index then
+    app.ui.status = t("status.no_audio_file_bound")
+    return false
+  end
+
+  local next_audio_files = {}
+  for _, entry in ipairs(audio_files) do
+    if normalize_search_text(entry.path or "") ~= normalize_search_text(remove_path) then
+      next_audio_files[#next_audio_files + 1] = entry
+    end
+  end
+
+  app.source.audio_files = next_audio_files
+  local next_entry = next_audio_files[math.min(remove_index, #next_audio_files)]
+  if next_entry then
+    select_audio_by_path(next_entry.path)
+  else
+    app.source.audio_path = nil
+    app.source.audio_name = nil
+    app.source.audio_loaded = false
+    app.source.audio_length_sec = nil
+    app.source.selected_audio_path = nil
+    app.source.audio_missing = false
+    app.source.audio_missing_path = nil
+    app.data.global_offset_ms = 0
+    sync_offset_input_from_state()
+  end
+
+  mark_metadata_dirty()
+  invalidate_source_library_cache()
+  app.ui.status = t("status.removed_audio_binding")
+  return true
 end
 
 --========================================================
 -- Preview helpers (SWS backend)
 --========================================================
 
-local function destroy_preview_sources()
+function destroy_preview_sources()
   if app.preview.section_source then
     reaper.PCM_Source_Destroy(app.preview.section_source)
     app.preview.section_source = nil
@@ -2393,7 +2583,7 @@ local function destroy_preview_sources()
   end
 end
 
-local function clear_preview_state(keep_error)
+function clear_preview_state(keep_error)
   app.preview.handle = nil
   app.preview.is_playing = false
   app.preview.backend = "none"
@@ -2415,7 +2605,7 @@ end
 
 require("reasrt.library_logic")(build_library_logic_env())
 
-local function validate_item_against_audio(item)
+function validate_item_against_audio(item)
   if not item then
     return false, t("status.no_subtitle_item_selected")
   end
@@ -2427,6 +2617,10 @@ local function validate_item_against_audio(item)
 
   if not audio_context.loaded or not audio_context.path then
     return false, t("status.no_audio_file_bound")
+  end
+
+  if not audio_context.length_sec then
+    return false, t("status.failed_get_audio_length")
   end
 
   local start_ms, end_ms = get_effective_item_bounds_ms(item)
@@ -2467,12 +2661,12 @@ local function validate_item_against_audio(item)
   }
 end
 
-local function validate_preview_target_against_audio()
+function validate_preview_target_against_audio()
   local item = get_last_selected_item()
   return validate_item_against_audio(item)
 end
 
-local function validate_multiple_items_against_audio(items)
+function validate_multiple_items_against_audio(items)
   if not items or #items == 0 then
     return false, t("status.no_subtitle_item_selected")
   end
@@ -2491,7 +2685,7 @@ local function validate_multiple_items_against_audio(items)
 end
 
 
-local function build_sws_preview_for_selected()
+function build_sws_preview_for_selected()
   local sws_ok, sws_message = Core.get_preview_backend_status(reaper)
   if not sws_ok then
     return false, sws_message
@@ -2558,7 +2752,7 @@ local function build_sws_preview_for_selected()
   }
 end
 
-local function start_preview_selected()
+function start_preview_selected()
   stop_preview()
 
   local ok, result = build_sws_preview_for_selected()
@@ -2584,7 +2778,7 @@ local function start_preview_selected()
   app.ui.status = t("status.preview_subtitle", preview_label)
 end
 
-local function update_preview_playback()
+function update_preview_playback()
   if not app.preview.handle then
     return
   end
@@ -2611,7 +2805,7 @@ local function update_preview_playback()
   end
 end
 
-local function set_take_name(take, name)
+function set_take_name(take, name)
   if not take then
     return
   end
@@ -2725,7 +2919,7 @@ function clear_peak_build_queue()
   app.peak_build.queued_paths = {}
 end
 
-local function insert_item_at_position(item, position_sec, track)
+function insert_item_at_position(item, position_sec, track)
   local ok_validate, info = validate_item_against_audio(item)
   if not ok_validate then
     return false, info
@@ -2771,7 +2965,7 @@ local function insert_item_at_position(item, position_sec, track)
   return true, media_item, length_sec
 end
 
-local function insert_selected_items_at_cursor()
+function insert_selected_items_at_cursor()
   if not reaper.GetCursorPosition then
     app.ui.status = t("status.cursor_api_unavailable")
     return false, app.ui.status
@@ -2829,7 +3023,7 @@ end
 -- Update helpers
 --========================================================
 
-local function update_selected_favorite(new_value)
+function update_selected_favorite(new_value)
   local item = get_last_selected_item()
   if not item then
     return
@@ -2858,7 +3052,7 @@ local function update_selected_favorite(new_value)
   app.ui.status = favorite and t("status.favorite_enabled") or t("status.favorite_disabled")
 end
 
-local function set_items_favorite(items, favorite)
+function set_items_favorite(items, favorite)
   favorite = favorite == true
   local changed = 0
 
@@ -2889,7 +3083,7 @@ local function set_items_favorite(items, favorite)
   return true
 end
 
-local function toggle_selected_items_favorite()
+function toggle_selected_items_favorite()
   local items = get_selected_items_in_index_order()
   if #items == 0 then
     app.ui.status = t("empty.no_item_selected")
@@ -2907,7 +3101,48 @@ local function toggle_selected_items_favorite()
   return set_items_favorite(items, should_enable)
 end
 
-local function update_selected_tags_text(new_tags_text)
+function set_clipboard_text(text)
+  text = tostring(text or "")
+
+  if reaper.ImGui_SetClipboardText then
+    local ok = pcall(reaper.ImGui_SetClipboardText, ctx, text)
+    if ok then
+      return true
+    end
+  end
+
+  if reaper.CF_SetClipboard then
+    local ok = pcall(reaper.CF_SetClipboard, text)
+    if ok then
+      return true
+    end
+  end
+
+  return false
+end
+
+function copy_selected_item_texts_to_clipboard()
+  local items = get_selected_items_in_index_order()
+  if #items == 0 then
+    app.ui.status = t("empty.no_item_selected")
+    return false
+  end
+
+  local lines = {}
+  for _, item in ipairs(items) do
+    lines[#lines + 1] = tostring(item.display_text or item.text or "")
+  end
+
+  if not set_clipboard_text(table.concat(lines, "\n")) then
+    app.ui.status = t("status.failed_copy_text")
+    return false
+  end
+
+  app.ui.status = t("status.copied_text", #items)
+  return true
+end
+
+function update_selected_tags_text(new_tags_text)
   local item = get_last_selected_item()
   if not item then
     return
@@ -2918,8 +3153,8 @@ local function update_selected_tags_text(new_tags_text)
     return
   end
 
+  local tags = parse_tags_text(normalized)
   if app.ui.content_mode == "library" and item.source_metadata_path then
-    local tags = parse_tags_text(normalized)
     local ok, err = LibraryPane.update_item_metadata(item, function(_, meta_item)
       meta_item.tags = tags
       meta_item.tags_text = join_tags(tags)
@@ -2939,7 +3174,98 @@ local function update_selected_tags_text(new_tags_text)
   app.ui.status = t("status.tags_updated")
 end
 
-local function prompt_edit_selected_tags()
+function set_item_tags(item, tags)
+  if not item then
+    return false
+  end
+
+  tags = tags or {}
+  local normalized = join_tags(tags)
+  if tostring(item.tags_text or "") == normalized then
+    return false
+  end
+
+  if app.ui.content_mode == "library" and item.source_metadata_path then
+    local ok, err = LibraryPane.update_item_metadata(item, function(_, meta_item)
+      meta_item.tags = tags
+      meta_item.tags_text = normalized
+    end)
+    if not ok then
+      app.ui.status = err or t("status.failed_update_tags")
+      return nil
+    end
+  else
+    mark_metadata_dirty()
+  end
+
+  item.tags = parse_tags_text(normalized)
+  item.tags_text = normalized
+  prepare_item_runtime_fields(item)
+  return true
+end
+
+function add_tags_to_selected_items(tags_text)
+  local add_tags = parse_tags_text(tags_text)
+  if #add_tags == 0 then
+    return false
+  end
+
+  local items = get_selected_items_in_index_order()
+  if #items == 0 then
+    app.ui.status = t("empty.no_item_selected")
+    return false
+  end
+
+  local changed = 0
+  for _, item in ipairs(items) do
+    local merged_tags = {}
+    for _, tag in ipairs(item.tags or parse_tags_text(item.tags_text)) do
+      merged_tags[#merged_tags + 1] = tag
+    end
+    for _, tag in ipairs(add_tags) do
+      merged_tags[#merged_tags + 1] = tag
+    end
+
+    local updated = set_item_tags(item, parse_tags_text(join_tags(merged_tags)))
+    if updated == nil then
+      return false
+    elseif updated then
+      changed = changed + 1
+    end
+  end
+
+  if changed > 0 then
+    invalidate_items()
+  end
+  app.ui.status = t("status.tags_added", #items)
+  return true
+end
+
+function clear_selected_item_tags()
+  local items = get_selected_items_in_index_order()
+  if #items == 0 then
+    app.ui.status = t("empty.no_item_selected")
+    return false
+  end
+
+  local changed = 0
+  for _, item in ipairs(items) do
+    local updated = set_item_tags(item, {})
+    if updated == nil then
+      return false
+    elseif updated then
+      changed = changed + 1
+    end
+  end
+
+  if changed > 0 then
+    invalidate_items()
+  end
+  app.ui.status = t("status.tags_cleared", #items)
+  return true
+end
+
+function prompt_edit_selected_tags()
   local item = get_last_selected_item()
   if not item then
     app.ui.status = t("empty.no_item_selected")
@@ -2965,7 +3291,32 @@ local function prompt_edit_selected_tags()
   return true
 end
 
-local function set_global_offset_ms(new_offset_ms)
+function prompt_add_tags_to_selected_items()
+  local items = get_selected_items_in_index_order()
+  if #items == 0 then
+    app.ui.status = t("empty.no_item_selected")
+    return false
+  end
+
+  if not reaper.GetUserInputs then
+    app.ui.status = t("status.failed_update_tags")
+    return false
+  end
+
+  local ok, value = reaper.GetUserInputs(
+    t("prompt.add_tags_title"),
+    1,
+    t("prompt.add_tags_value"),
+    ""
+  )
+  if not ok then
+    return false
+  end
+
+  return add_tags_to_selected_items(value)
+end
+
+function set_global_offset_ms(new_offset_ms)
   local normalized = parse_integer(new_offset_ms, 0) or 0
   if normalized == get_global_offset_ms() then
     sync_offset_input_from_state()
@@ -2979,14 +3330,42 @@ local function set_global_offset_ms(new_offset_ms)
 
   app.data.global_offset_ms = normalized
   sync_offset_input_from_state()
+
+  if app.ui.content_mode == "library" then
+    local item = get_last_selected_item()
+    if item and item.source_metadata_path then
+      local ok, err = LibraryPane.update_source_metadata(item, function(payload)
+        local entry = get_selected_audio_entry(payload.audio_files, item.source_audio_path)
+        if entry then
+          entry.offset_ms = normalized
+          payload.selected_audio_path = tostring(entry.path or "")
+        end
+        payload.global_offset_ms = normalized
+      end)
+      if not ok then
+        app.ui.status = err or t("status.failed_bind_audio")
+        return false
+      end
+      LibraryPane.reload_active_view({
+        reset_filters = false,
+        selected_item_key = item.key,
+      })
+    end
+  else
+    local entry = get_selected_audio_entry(app.source.audio_files, app.source.selected_audio_path)
+    if entry then
+      entry.offset_ms = normalized
+    end
+    mark_metadata_dirty()
+  end
+
   prepare_all_runtime_fields()
   invalidate_items()
-  mark_metadata_dirty()
   app.ui.status = t("status.global_offset_set", format_signed_ms(normalized))
   return true
 end
 
-local function extract_speaker_tag(text)
+function extract_speaker_tag(text)
   text = tostring(text or "")
   local full_open = string.char(239, 188, 136)
   local full_close = string.char(239, 188, 137)
@@ -3004,7 +3383,7 @@ local function extract_speaker_tag(text)
   return speaker
 end
 
-local function apply_speaker_tags_to_items()
+function apply_speaker_tags_to_items()
   if not app.source.srt_loaded then
     app.ui.status = t("status.no_srt_loaded")
     return false
@@ -3051,7 +3430,7 @@ local function apply_speaker_tags_to_items()
   return false
 end
 
-local function set_hide_speaker_labels_enabled(enabled)
+function set_hide_speaker_labels_enabled(enabled)
   enabled = enabled == true
   if app.settings.hide_speaker_labels == enabled then
     return false
@@ -3335,16 +3714,16 @@ local function build_minimal_metadata_payload_for_srt(path, items)
   }
 end
 
-function find_auto_audio_path_for_srt(path)
+function find_auto_audio_paths_for_srt(path)
   path = tostring(path or "")
   if path == "" or not (reaper and reaper.EnumerateFiles) then
-    return nil
+    return {}
   end
 
   local dir_path = Core.get_parent_dir(path)
   local srt_stem = normalize_search_text(Core.get_file_stem(path))
   if dir_path == "" or srt_stem == "" then
-    return nil
+    return {}
   end
 
   local exact = {}
@@ -3357,7 +3736,7 @@ function find_auto_audio_path_for_srt(path)
     end
 
     local normalized_name = normalize_search_text(name)
-    if normalized_name:match("%.wav$") then
+    if is_supported_audio_file_path(name) then
       local stem = normalize_search_text(Core.get_file_stem(name))
       if stem == srt_stem then
         exact[#exact + 1] = name
@@ -3369,26 +3748,42 @@ function find_auto_audio_path_for_srt(path)
     index = index + 1
   end
 
-  local candidates = #exact > 0 and exact or partial
-  if #candidates == 0 then
-    return nil
+  local function sort_candidates(candidates)
+    table.sort(candidates, function(a, b)
+      if #a ~= #b then
+        return #a < #b
+      end
+
+      local normalized_a = normalize_search_text(a)
+      local normalized_b = normalize_search_text(b)
+      if normalized_a ~= normalized_b then
+        return compare_text_case_insensitive(a, b)
+      end
+
+      return a < b
+    end)
   end
 
-  table.sort(candidates, function(a, b)
-    if #a ~= #b then
-      return #a < #b
-    end
+  sort_candidates(exact)
+  sort_candidates(partial)
 
-    local normalized_a = normalize_search_text(a)
-    local normalized_b = normalize_search_text(b)
-    if normalized_a ~= normalized_b then
-      return compare_text_case_insensitive(a, b)
-    end
+  local candidates = {}
+  for _, name in ipairs(exact) do
+    candidates[#candidates + 1] = name
+  end
+  for _, name in ipairs(partial) do
+    candidates[#candidates + 1] = name
+  end
+  if #candidates == 0 then
+    return {}
+  end
 
-    return a < b
-  end)
+  local paths = {}
+  for _, name in ipairs(candidates) do
+    paths[#paths + 1] = Core.join_path(dir_path, name)
+  end
 
-  return Core.join_path(dir_path, candidates[1])
+  return paths
 end
 
 local function ensure_srt_in_library(path)
@@ -3421,15 +3816,21 @@ local function ensure_srt_in_library(path)
   end
 
   local payload = build_minimal_metadata_payload_for_srt(path, items)
-  local auto_audio_path = find_auto_audio_path_for_srt(path)
-  if auto_audio_path then
-    payload.audio_files = {
-      {
+  local auto_audio_paths = find_auto_audio_paths_for_srt(path)
+  for index, auto_audio_path in ipairs(auto_audio_paths) do
+    local length_sec = get_media_length_sec(auto_audio_path)
+    if length_sec then
+      payload.audio_files[#payload.audio_files + 1] = {
         path = auto_audio_path,
-        label = "primary",
-        is_primary = true,
+        label = "",
+        is_primary = index == 1,
+        offset_ms = 0,
+        length_sec = length_sec,
       }
-    }
+    end
+  end
+  if payload.audio_files[1] then
+    payload.selected_audio_path = payload.audio_files[1].path
   end
   local encoded = json_encode(payload)
   local ok, write_err = write_text_file_utf8(metadata_path, encoded)
@@ -3493,6 +3894,53 @@ prompt_select_multiple_srt_paths_windows = function()
   end
 
   return paths
+end
+
+prompt_select_audio_path_windows = function()
+  if not reaper.ExecProcess then
+    return nil, t("status.execprocess_unavailable")
+  end
+
+  local output_path, path_err = build_temp_output_path("audio_picker", ".txt")
+  if not output_path then
+    return nil, path_err or t("status.failed_resolve_temp_output_path")
+  end
+
+  local output_path_escaped = escape_powershell_single_quoted(output_path)
+  local initial_dir = get_dialog_browse_dir("audio")
+  local initial_dir_command = ""
+  if initial_dir and initial_dir ~= "" then
+    initial_dir_command = "$dlg.InitialDirectory = '" .. escape_powershell_single_quoted(initial_dir) .. "'; "
+  end
+
+  local filter = get_supported_audio_dialog_filter()
+  local command = [[powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.Windows.Forms; $dlg = New-Object System.Windows.Forms.OpenFileDialog; $dlg.Multiselect = $false; $dlg.Filter = ']] .. escape_powershell_single_quoted(filter) .. [['; ]] .. initial_dir_command .. [[$dlg.Title = ']] .. escape_powershell_single_quoted(t("prompt.open_audio_title")) .. [['; if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $enc = New-Object System.Text.UTF8Encoding($false); [System.IO.File]::WriteAllText(']] .. output_path_escaped .. [[', $dlg.FileName, $enc) }"]]
+  local output = reaper.ExecProcess(command, 0)
+  if output == nil then
+    return nil, t("status.failed_launch_file_dialog")
+  end
+
+  local exit_code = parse_execprocess_result(output)
+  if exit_code ~= 0 then
+    return nil, t("status.file_dialog_exit_code", tostring(exit_code))
+  end
+
+  if not file_exists(output_path) then
+    return nil, nil
+  end
+
+  local content, read_err = read_text_file_utf8(output_path)
+  delete_file(output_path)
+  if not content then
+    return nil, read_err or t("status.failed_read_selected_audio_path")
+  end
+
+  local path = trim(content)
+  if path == "" then
+    return nil, nil
+  end
+
+  return path
 end
 
 add_srt_paths_to_library = function(paths)
@@ -3606,33 +4054,108 @@ require("reasrt.library_pane")(build_pane_module_env())
 -- UI helpers
 --========================================================
 
+function get_audio_binding_ui_context()
+  if app.ui.content_mode == "library" then
+    local item = get_last_selected_item()
+    return {
+      item = item,
+      entries = item and item.source_audio_files or {},
+      selected_path = item and item.source_audio_path or nil,
+    }
+  end
+
+  return {
+    item = nil,
+    entries = app.source.audio_files or {},
+    selected_path = app.source.selected_audio_path or app.source.audio_path,
+  }
+end
+
+function select_audio_binding_from_ui(path)
+  if app.ui.content_mode == "library" then
+    local item = get_last_selected_item()
+    if not item then
+      app.ui.status = t("status.no_library_item_selected")
+      return false
+    end
+    return LibraryPane.select_audio_for_item_source(item, path)
+  end
+
+  if select_audio_by_path then
+    return select_audio_by_path(path)
+  end
+  return false
+end
+
+function sync_offset_state_from_selected_library_item()
+  if app.ui.content_mode ~= "library" then
+    return
+  end
+  local item = get_last_selected_item()
+  if not item then
+    return
+  end
+  app.data.global_offset_ms = parse_integer(item.source_global_offset_ms, 0) or 0
+  sync_offset_input_from_state()
+end
+
+function draw_audio_binding_combo()
+  local context = get_audio_binding_ui_context()
+  local entries = context.entries or {}
+  local selected_entry = get_selected_audio_entry(entries, context.selected_path)
+  local preview = selected_entry and get_audio_entry_display_name(selected_entry) or t("label.none")
+
+  reaper.ImGui_Text(ctx, t("label.audio") .. ":")
+  reaper.ImGui_SameLine(ctx)
+  reaper.ImGui_SetNextItemWidth(ctx, 280)
+
+  if reaper.ImGui_BeginCombo and reaper.ImGui_EndCombo and reaper.ImGui_Selectable then
+    if reaper.ImGui_BeginCombo(ctx, "##audio_binding_combo", preview) then
+      if #entries == 0 then
+        reaper.ImGui_Selectable(ctx, t("label.none"), true)
+      else
+        for index, entry in ipairs(entries) do
+          local path = tostring(entry.path or "")
+          local label = get_audio_entry_display_name(entry) .. "##audio_binding_" .. tostring(index)
+          local selected = selected_entry and normalize_search_text(selected_entry.path or "") == normalize_search_text(path)
+          if reaper.ImGui_Selectable(ctx, label, selected) and path ~= "" and not selected then
+            select_audio_binding_from_ui(path)
+          end
+        end
+      end
+      reaper.ImGui_EndCombo(ctx)
+    end
+  else
+    reaper.ImGui_TextWrapped(ctx, preview)
+  end
+end
+
 function draw_source_summary()
   local srt_summary = t("label.none")
-  local audio_summary = t("label.none")
 
   if app.ui.content_mode == "library" then
     local item = get_last_selected_item()
     if item then
       srt_summary = tostring(item.source_name or t("label.none"))
-      if item.source_audio_missing and item.source_audio_name and item.source_audio_name ~= "" then
-        audio_summary = t("label.audio_missing_file", tostring(item.source_audio_name))
-      elseif item.source_audio_name and item.source_audio_name ~= "" then
-        audio_summary = tostring(item.source_audio_name)
-      end
     end
   else
     srt_summary = app.source.srt_loaded and tostring(app.source.srt_name or "") or t("label.none")
-    audio_summary = SourcePane.get_current_audio_path_summary()
   end
 
   reaper.ImGui_TextWrapped(ctx, t("label.srt") .. ": " .. srt_summary)
-  if app.ui.content_mode ~= "library" then
-    if reaper.ImGui_Button(ctx, t("button.open_audio")) then
-      trigger_ui_action("open_audio")
-    end
-    reaper.ImGui_SameLine(ctx)
+  if reaper.ImGui_Button(ctx, t("button.open_audio")) then
+    trigger_ui_action("open_audio")
   end
-  reaper.ImGui_TextWrapped(ctx, t("label.audio") .. ": " .. audio_summary)
+  reaper.ImGui_SameLine(ctx)
+  draw_audio_binding_combo()
+  local context = get_audio_binding_ui_context()
+  local selected_entry = get_selected_audio_entry(context.entries, context.selected_path)
+  local selected_path = selected_entry and tostring(selected_entry.path or "") or ""
+  local audio_missing = selected_path ~= "" and not file_exists(selected_path)
+  if audio_missing then
+    reaper.ImGui_SameLine(ctx)
+    reaper.ImGui_TextWrapped(ctx, t("label.audio_missing_file", get_audio_entry_display_name(selected_entry)))
+  end
 end
 
 function get_current_item_sort_mode()
@@ -3731,6 +4254,18 @@ function handle_global_shortcuts()
     return
   end
 
+  local ctrl_down = false
+  if reaper.ImGui_IsKeyDown and reaper.ImGui_Mod_Ctrl then
+    ctrl_down = reaper.ImGui_IsKeyDown(ctx, reaper.ImGui_Mod_Ctrl())
+  end
+
+  if ctrl_down and reaper.ImGui_IsKeyPressed and reaper.ImGui_Key_C then
+    if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_C(), false) then
+      copy_selected_item_texts_to_clipboard()
+      return
+    end
+  end
+
   -- 上キー: 1つ上へ
   if reaper.ImGui_IsKeyPressed and reaper.ImGui_Key_UpArrow then
     if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_UpArrow(), false) then
@@ -3810,6 +4345,8 @@ trigger_ui_action = function(action_id)
     LibraryPane.prompt_create_library()
   elseif action_id == "open_audio" then
     prompt_open_audio()
+  elseif action_id == "remove_audio_binding" then
+    remove_selected_audio_binding()
   elseif action_id == "reload_library" then
     LibraryPane.reload_active_view({
       reset_filters = false,
@@ -3826,7 +4363,16 @@ trigger_ui_action = function(action_id)
   elseif action_id == "favorite_selected_item" then
     set_items_favorite(get_selected_items_in_index_order(), true)
   elseif action_id == "edit_selected_tags" then
-    prompt_edit_selected_tags()
+    local selected_items = get_selected_items_in_index_order()
+    if #selected_items > 1 then
+      prompt_add_tags_to_selected_items()
+    else
+      prompt_edit_selected_tags()
+    end
+  elseif action_id == "add_selected_tags" then
+    prompt_add_tags_to_selected_items()
+  elseif action_id == "clear_selected_tags" then
+    clear_selected_item_tags()
   elseif action_id == "add_speaker_tags" then
     apply_speaker_tags_to_items()
   elseif action_id == "apply_offset" then
@@ -4259,7 +4805,13 @@ function draw_top_bar()
   reaper.ImGui_Separator(ctx)
 
   if draw_toggle_button(t("toggle.favorites_only"), app.ui.filter_favorites_only) then
+    local was_favorites_only = app.ui.filter_favorites_only
     app.ui.filter_favorites_only = not app.ui.filter_favorites_only
+    if was_favorites_only and not app.ui.filter_favorites_only then
+      app.ui.pending_scroll_to_selected_item = true
+      app.ui.pending_scroll_to_item_key = nil
+      app.ui.pending_scroll_to_item_pos = nil
+    end
     invalidate_filter_cache()
     app.ui.status = t("status.filter_favorites_updated")
   end
@@ -4462,6 +5014,8 @@ function handle_item_selection_interaction(item)
     set_single_selection(item.key)
     app.ui.status = t("status.selected_item_index", tostring(item.srt_index))
   end
+
+  sync_offset_state_from_selected_library_item()
 end
 
 function prepare_item_context_selection(item)
@@ -4488,18 +5042,29 @@ function draw_item_context_menu(item, popup_id)
 
   if reaper.ImGui_BeginPopupContextItem(ctx, popup_id) then
     prepare_item_context_selection(item)
+    local selected_items = get_selected_items_in_index_order()
+    local selected_count = #selected_items
 
     if reaper.ImGui_MenuItem(ctx, t("menu.insert_selected_items")) then
       insert_selected_items_at_cursor()
     end
-    if reaper.ImGui_MenuItem(ctx, t("menu.preview_selected_items")) then
+    if selected_count <= 1 and reaper.ImGui_MenuItem(ctx, t("menu.preview_selected_items")) then
       start_preview_selected()
     end
     if reaper.ImGui_MenuItem(ctx, t("menu.favorite_selected_item")) then
-      set_items_favorite(get_selected_items_in_index_order(), true)
+      set_items_favorite(selected_items, true)
     end
-    if reaper.ImGui_MenuItem(ctx, t("menu.edit_selected_tags")) then
-      prompt_edit_selected_tags()
+    if selected_count > 1 then
+      if reaper.ImGui_MenuItem(ctx, t("menu.add_selected_tags")) then
+        prompt_add_tags_to_selected_items()
+      end
+    else
+      if reaper.ImGui_MenuItem(ctx, t("menu.edit_selected_tags")) then
+        prompt_edit_selected_tags()
+      end
+    end
+    if reaper.ImGui_MenuItem(ctx, t("menu.clear_selected_tags")) then
+      clear_selected_item_tags()
     end
 
     reaper.ImGui_EndPopup(ctx)
@@ -4944,7 +5509,17 @@ function draw_detail_pane()
     return
   end
 
-  if app.ui.content_mode ~= "library" then
+  local item = get_last_selected_item()
+  if app.ui.content_mode == "library" and item then
+    local offset_context_key = tostring(item.key or "") .. "|" .. tostring(item.source_audio_path or "")
+    if app.ui.offset_input_context_key ~= offset_context_key then
+      app.ui.offset_input_context_key = offset_context_key
+      app.data.global_offset_ms = parse_integer(item.source_global_offset_ms, 0) or 0
+      sync_offset_input_from_state()
+    end
+  end
+
+  if app.ui.content_mode ~= "library" or item then
     reaper.ImGui_Text(ctx, t("label.global_offset"))
     reaper.ImGui_SameLine(ctx)
     if reaper.ImGui_TextDisabled then
@@ -4974,8 +5549,6 @@ function draw_detail_pane()
     end
     reaper.ImGui_Separator(ctx)
   end
-
-  local item = get_last_selected_item()
 
   if not item then
     reaper.ImGui_TextWrapped(ctx, t("empty.no_item_selected"))

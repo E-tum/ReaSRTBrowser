@@ -17,7 +17,7 @@ return function(env)
   local read_text_file_utf8 = env.read_text_file_utf8
   local json_decode = env.json_decode
   local copy_audio_file_entries = env.copy_audio_file_entries
-  local get_primary_audio_file_entry = env.get_primary_audio_file_entry
+  local get_selected_audio_entry = env.get_selected_audio_entry
   local file_exists = env.file_exists
   local get_filename = env.get_filename
   local parse_integer = env.parse_integer
@@ -518,8 +518,8 @@ return function(env)
           end
 
           local audio_files = copy_audio_file_entries(decoded.audio_files)
-          local primary_audio = get_primary_audio_file_entry(audio_files)
-          local audio_path = primary_audio and tostring(primary_audio.path or "") or ""
+          local active_audio = get_selected_audio_entry(audio_files, decoded.selected_audio_path)
+          local audio_path = active_audio and tostring(active_audio.path or "") or ""
           local audio_missing = audio_path ~= "" and not file_exists(audio_path)
 
           if app.source.srt_loaded and app.source.metadata_path == metadata_path then
@@ -673,7 +673,10 @@ return function(env)
           if source_name == "" then
             source_name = get_filename(metadata_path)
           end
-          local offset_ms = parse_integer(decoded.global_offset_ms, 0) or 0
+          local audio_files = copy_audio_file_entries(decoded.audio_files)
+          local active_audio = get_selected_audio_entry(audio_files, decoded.selected_audio_path)
+          local offset_ms = active_audio and (parse_integer(active_audio.offset_ms, 0) or 0)
+            or (parse_integer(decoded.global_offset_ms, 0) or 0)
 
           for _, meta_item in ipairs(decoded.items) do
             local key = type(meta_item.key) == "table" and meta_item.key or {}

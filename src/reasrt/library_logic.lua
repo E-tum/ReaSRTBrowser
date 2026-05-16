@@ -13,7 +13,11 @@ return function(env)
   local get_filename = env.get_filename
   local refresh_source_library_cache = env.refresh_source_library_cache
   local copy_audio_file_entries = env.copy_audio_file_entries
-  local get_primary_audio_file_entry = env.get_primary_audio_file_entry
+  local get_selected_audio_entry = env.get_selected_audio_entry
+  local find_audio_entry_index = env.find_audio_entry_index
+  local get_audio_entry_display_name = env.get_audio_entry_display_name
+  local is_supported_audio_file_path = env.is_supported_audio_file_path
+  local normalize_search_text = env.normalize_search_text
   local parse_integer = env.parse_integer
   local parse_tags_text = env.parse_tags_text
   local join_tags = env.join_tags
@@ -28,6 +32,14 @@ return function(env)
   local invalidate_filter_cache = env.invalidate_filter_cache
   local set_left_panel_tab = env.set_left_panel_tab or function(tab_name)
     app.ui.left_panel_tab = tab_name
+  end
+
+  local function audio_path_key(path)
+    path = tostring(path or "")
+    if normalize_search_text then
+      return normalize_search_text(path)
+    end
+    return path:lower()
   end
   local mark_settings_dirty = env.mark_settings_dirty or function()
   end
@@ -98,7 +110,42 @@ return function(env)
     return nil
   end
 
-  function LibraryPane.bind_audio_to_item(item, path)
+  function LibraryPane.normalize_payload_audio_state(payload)
+    payload.audio_files = copy_audio_file_entries(payload.audio_files)
+    local fallback_offset_ms = parse_integer(payload.global_offset_ms, 0) or 0
+    for index, entry in ipairs(payload.audio_files) do
+      if entry.offset_ms == nil then
+        entry.offset_ms = index == 1 and fallback_offset_ms or 0
+      end
+    end
+
+    local selected_entry = get_selected_audio_entry(payload.audio_files, payload.selected_audio_path)
+    payload.selected_audio_path = selected_entry and tostring(selected_entry.path or "") or ""
+    payload.global_offset_ms = selected_entry and (parse_integer(selected_entry.offset_ms, 0) or 0) or 0
+    return selected_entry
+  end
+
+  function LibraryPane.update_source_metadata(item, update_fn)
+    if not item or not item.source_metadata_path then
+      return false, t("status.no_library_item_selected")
+    end
+
+    local ok, payload_or_err = LibraryPane.read_metadata_payload(item.source_metadata_path)
+    if not ok then
+      return false, payload_or_err
+    end
+
+    local payload = payload_or_err
+    LibraryPane.normalize_payload_audio_state(payload)
+    update_fn(payload)
+    local save_ok, save_err = LibraryPane.write_metadata_payload(item.source_metadata_path, payload)
+    if not save_ok then
+      return false, save_err
+    end
+    return true, payload
+  end
+
+  function LibraryPane.add_audio_to_item_source(item, path)
     if not item or not item.source_metadata_path then
       return false, t("status.no_library_item_selected")
     end
@@ -107,21 +154,43 @@ return function(env)
     if path == "" then
       return false, t("status.no_audio_file_selected")
     end
-
-    local ok, err = LibraryPane.update_item_metadata(item, function(payload)
-      payload.audio_files = {
-        {
-          path = path,
-          label = "primary",
-          is_primary = true,
-        }
-      }
-    end)
-    if not ok then
-      return false, err or t("status.failed_bind_audio")
+    if is_supported_audio_file_path and not is_supported_audio_file_path(path) then
+      app.ui.status = t("status.unsupported_audio_file")
+      return false, app.ui.status
     end
 
-    app.user_libraries.audio_length_cache[path] = get_media_length_sec(path)
+    local audio_length_sec = get_media_length_sec(path)
+    if not audio_length_sec then
+      app.ui.status = t("status.failed_get_audio_length")
+      return false, app.ui.status
+    end
+
+    local ok, payload_or_err = LibraryPane.update_source_metadata(item, function(payload)
+      local audio_files = copy_audio_file_entries(payload.audio_files)
+      local index = find_audio_entry_index(audio_files, path)
+      local selected_offset_ms = 0
+      if index then
+        audio_files[index].length_sec = audio_length_sec
+        selected_offset_ms = parse_integer(audio_files[index].offset_ms, 0) or 0
+      else
+        audio_files[#audio_files + 1] = {
+          path = path,
+          label = "",
+          is_primary = #audio_files == 0,
+          offset_ms = 0,
+          length_sec = audio_length_sec,
+        }
+      end
+      payload.audio_files = audio_files
+      payload.selected_audio_path = path
+      payload.global_offset_ms = selected_offset_ms
+    end)
+    if not ok then
+      app.ui.status = payload_or_err or t("status.failed_bind_audio")
+      return false, app.ui.status
+    end
+
+    app.user_libraries.audio_length_cache[path] = audio_length_sec
     if app.ui.content_mode == "library" and app.ui.active_library_id then
       LibraryPane.reload_active_view({
         reset_filters = false,
@@ -130,7 +199,80 @@ return function(env)
     end
 
     local audio_name = get_filename(path) or path
-    app.ui.status = t("status.bound_audio", audio_name)
+    app.ui.status = t("status.bound_audio_with_length", audio_name, audio_length_sec)
+    return true, app.ui.status
+  end
+
+  function LibraryPane.select_audio_for_item_source(item, path)
+    if not item or not item.source_metadata_path then
+      return false, t("status.no_library_item_selected")
+    end
+
+    path = tostring(path or "")
+    local ok, payload_or_err = LibraryPane.update_source_metadata(item, function(payload)
+      local entry = get_selected_audio_entry(payload.audio_files, path)
+      payload.selected_audio_path = entry and tostring(entry.path or "") or ""
+      payload.global_offset_ms = entry and (parse_integer(entry.offset_ms, 0) or 0) or 0
+    end)
+    if not ok then
+      app.ui.status = payload_or_err or t("status.failed_bind_audio")
+      return false, app.ui.status
+    end
+
+    if app.ui.content_mode == "library" and app.ui.active_library_id then
+      LibraryPane.reload_active_view({
+        reset_filters = false,
+        selected_item_key = item.key,
+      })
+    end
+
+    local selected_entry = get_selected_audio_entry(payload_or_err.audio_files, payload_or_err.selected_audio_path)
+    app.ui.status = t("status.selected_audio_binding", get_audio_entry_display_name(selected_entry))
+    return true, app.ui.status
+  end
+
+  function LibraryPane.remove_selected_audio_from_item_source(item)
+    if not item or not item.source_metadata_path then
+      return false, t("status.no_library_item_selected")
+    end
+
+    local remove_path = tostring(item.source_audio_path or "")
+    if remove_path == "" then
+      app.ui.status = t("status.no_audio_file_bound")
+      return false, app.ui.status
+    end
+
+    local ok, payload_or_err = LibraryPane.update_source_metadata(item, function(payload)
+      local current_index = find_audio_entry_index(payload.audio_files, remove_path)
+      local remove_key = audio_path_key(remove_path)
+      local next_audio_files = {}
+      for _, entry in ipairs(payload.audio_files or {}) do
+        if audio_path_key(entry.path) ~= remove_key then
+          next_audio_files[#next_audio_files + 1] = entry
+        end
+      end
+      payload.audio_files = next_audio_files
+
+      local next_entry = nil
+      if #next_audio_files > 0 then
+        next_entry = next_audio_files[math.min(current_index or 1, #next_audio_files)]
+      end
+      payload.selected_audio_path = next_entry and tostring(next_entry.path or "") or ""
+      payload.global_offset_ms = next_entry and (parse_integer(next_entry.offset_ms, 0) or 0) or 0
+    end)
+    if not ok then
+      app.ui.status = payload_or_err or t("status.failed_bind_audio")
+      return false, app.ui.status
+    end
+
+    if app.ui.content_mode == "library" and app.ui.active_library_id then
+      LibraryPane.reload_active_view({
+        reset_filters = false,
+        selected_item_key = item.key,
+      })
+    end
+
+    app.ui.status = t("status.removed_audio_binding")
     return true, app.ui.status
   end
 
@@ -220,12 +362,12 @@ return function(env)
           source_name = get_filename(source_path) or get_filename(metadata_path) or "(unknown)"
         end
 
+        local active_audio = LibraryPane.normalize_payload_audio_state(payload)
         local audio_files = copy_audio_file_entries(payload.audio_files)
-        local primary_audio = get_primary_audio_file_entry(audio_files)
-        local primary_audio_path = primary_audio and tostring(primary_audio.path or "") or ""
-        local primary_audio_name = primary_audio_path ~= "" and (get_filename(primary_audio_path) or primary_audio_path) or ""
-        local audio_missing = primary_audio_path ~= "" and not file_exists(primary_audio_path)
-        local source_global_offset_ms = parse_integer(payload.global_offset_ms, 0) or 0
+        local active_audio_path = active_audio and tostring(active_audio.path or "") or ""
+        local active_audio_name = active_audio_path ~= "" and (get_filename(active_audio_path) or active_audio_path) or ""
+        local audio_missing = active_audio_path ~= "" and not file_exists(active_audio_path)
+        local source_global_offset_ms = active_audio and (parse_integer(active_audio.offset_ms, 0) or 0) or 0
 
         if type(payload.items) == "table" then
           for _, meta_item in ipairs(payload.items) do
@@ -244,8 +386,9 @@ return function(env)
               source_name = source_name,
               source_global_offset_ms = source_global_offset_ms,
               source_audio_files = audio_files,
-              source_audio_path = primary_audio_path,
-              source_audio_name = primary_audio_name,
+              source_selected_audio_path = payload.selected_audio_path,
+              source_audio_path = active_audio_path,
+              source_audio_name = active_audio_name,
               source_audio_missing = audio_missing,
             }
           end

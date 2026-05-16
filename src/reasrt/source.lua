@@ -6,7 +6,9 @@ return function(env)
   local join_tags = env.join_tags
   local make_item_lookup_key = env.make_item_lookup_key
   local copy_audio_file_entries = env.copy_audio_file_entries
-  local get_primary_audio_file_entry = env.get_primary_audio_file_entry
+  local get_selected_audio_entry = env.get_selected_audio_entry
+  local find_audio_entry_index = env.find_audio_entry_index
+  local is_supported_audio_file_path = env.is_supported_audio_file_path
   local file_exists = env.file_exists
   local get_media_length_sec = env.get_media_length_sec
   local get_filename = env.get_filename
@@ -44,7 +46,15 @@ return function(env)
   local set_single_source_selection = env.set_single_source_selection
   local stop_preview = env.stop_preview
 
+  local function sync_current_audio_offset_to_entry()
+    local entry = get_selected_audio_entry(app.source.audio_files, app.source.selected_audio_path)
+    if entry then
+      entry.offset_ms = get_global_offset_ms()
+    end
+  end
+
   local function build_metadata_payload()
+    sync_current_audio_offset_to_entry()
     local items = {}
 
     for _, item in ipairs(app.data.items) do
@@ -68,6 +78,8 @@ return function(env)
         path = app.source.audio_path,
         label = "primary",
         is_primary = true,
+        offset_ms = get_global_offset_ms(),
+        length_sec = app.source.audio_length_sec,
       }
     end
 
@@ -79,6 +91,7 @@ return function(env)
       },
       audio_files = audio_files,
       global_offset_ms = get_global_offset_ms(),
+      selected_audio_path = app.source.selected_audio_path or "",
       items = items,
     }
   end
@@ -128,6 +141,7 @@ return function(env)
     app.source.audio_name = nil
     app.source.audio_loaded = false
     app.source.audio_length_sec = nil
+    app.source.selected_audio_path = nil
     app.source.audio_missing = false
     app.source.audio_missing_path = nil
   end
@@ -136,17 +150,20 @@ return function(env)
     app.source.audio_files = copy_audio_file_entries(entries)
   end
 
-  local function apply_audio_binding_from_metadata(metadata)
-    local audio_files = copy_audio_file_entries(metadata and metadata.audio_files or {})
-    set_audio_binding_entries(audio_files)
+  local function select_audio_entry(entry)
     reset_audio_runtime_state()
 
-    local primary_entry = get_primary_audio_file_entry(audio_files)
-    if not primary_entry then
+    if not entry then
+      app.data.global_offset_ms = 0
+      sync_offset_input_from_state()
       return true, t("status.metadata_loaded")
     end
 
-    local audio_path = tostring(primary_entry.path or "")
+    local audio_path = tostring(entry.path or "")
+    app.source.selected_audio_path = audio_path
+    app.data.global_offset_ms = parse_integer(entry.offset_ms, 0) or 0
+    sync_offset_input_from_state()
+
     if audio_path == "" then
       return true, t("status.metadata_loaded")
     end
@@ -157,12 +174,31 @@ return function(env)
       return true, t("status.metadata_loaded_missing_audio")
     end
 
-    local audio_length_sec = get_media_length_sec(audio_path)
+    local audio_length_sec = tonumber(entry.length_sec) or get_media_length_sec(audio_path)
+    if not audio_length_sec then
+      app.source.audio_missing = true
+      app.source.audio_missing_path = audio_path
+      return true, t("status.failed_get_audio_length")
+    end
     app.source.audio_path = audio_path
     app.source.audio_name = get_filename(audio_path)
     app.source.audio_loaded = true
     app.source.audio_length_sec = audio_length_sec
+    entry.length_sec = audio_length_sec
     return true, t("status.metadata_loaded_audio_restored")
+  end
+
+  local function apply_audio_binding_from_metadata(metadata)
+    local audio_files = copy_audio_file_entries(metadata and metadata.audio_files or {})
+    local fallback_offset_ms = parse_integer(metadata and metadata.global_offset_ms, 0) or 0
+    for index, entry in ipairs(audio_files) do
+      if entry.offset_ms == nil then
+        entry.offset_ms = index == 1 and fallback_offset_ms or 0
+      end
+    end
+    set_audio_binding_entries(audio_files)
+    local selected_entry = get_selected_audio_entry(audio_files, metadata and metadata.selected_audio_path)
+    return select_audio_entry(selected_entry)
   end
 
   local function load_metadata_json(metadata_path)
@@ -220,18 +256,18 @@ return function(env)
     return files
   end
 
-  local function find_auto_audio_path_for_srt(srt_path)
+  local function find_auto_audio_paths_for_srt(srt_path)
     local dir_path = get_parent_dir(srt_path)
     local srt_stem = normalize_search_text(get_file_stem(srt_path))
     if dir_path == "" or srt_stem == "" then
-      return nil
+      return {}
     end
 
     local exact = {}
     local partial = {}
     for _, name in ipairs(enumerate_files_in_directory(dir_path)) do
       local normalized_name = normalize_search_text(name)
-      if normalized_name:match("%.wav$") then
+      if is_supported_audio_file_path(name) then
         local stem = normalize_search_text(get_file_stem(name))
         if stem == srt_stem then
           exact[#exact + 1] = name
@@ -241,30 +277,46 @@ return function(env)
       end
     end
 
-    local candidates = #exact > 0 and exact or partial
-    if #candidates == 0 then
-      return nil
+    local function sort_candidates(candidates)
+      table.sort(candidates, function(a, b)
+        if #a ~= #b then
+          return #a < #b
+        end
+
+        local normalized_a = normalize_search_text(a)
+        local normalized_b = normalize_search_text(b)
+        if normalized_a ~= normalized_b then
+          return compare_text_case_insensitive(a, b)
+        end
+
+        return a < b
+      end)
     end
 
-    table.sort(candidates, function(a, b)
-      if #a ~= #b then
-        return #a < #b
-      end
+    sort_candidates(exact)
+    sort_candidates(partial)
 
-      local normalized_a = normalize_search_text(a)
-      local normalized_b = normalize_search_text(b)
-      if normalized_a ~= normalized_b then
-        return compare_text_case_insensitive(a, b)
-      end
+    local candidates = {}
+    for _, name in ipairs(exact) do
+      candidates[#candidates + 1] = name
+    end
+    for _, name in ipairs(partial) do
+      candidates[#candidates + 1] = name
+    end
+    if #candidates == 0 then
+      return {}
+    end
 
-      return a < b
-    end)
+    local paths = {}
+    for _, name in ipairs(candidates) do
+      paths[#paths + 1] = join_path(dir_path, name)
+    end
 
-    return join_path(dir_path, candidates[1])
+    return paths
   end
 
   local function should_try_auto_bind_audio()
-    if app.source.audio_loaded and app.source.audio_path and app.source.audio_path ~= "" and not app.source.audio_missing then
+    if #(app.source.audio_files or {}) > 0 then
       return false
     end
 
@@ -457,20 +509,28 @@ return function(env)
     end
 
     if should_try_auto_bind_audio() then
-      local auto_audio_path = find_auto_audio_path_for_srt(path)
-      if auto_audio_path then
+      local auto_audio_paths = find_auto_audio_paths_for_srt(path)
+      local auto_bound_count = 0
+      local first_bound_audio_path = nil
+      for _, auto_audio_path in ipairs(auto_audio_paths) do
         local auto_bound_ok = env.load_audio_from_path(auto_audio_path, {
           update_metadata = true,
           mark_dirty = app.source.metadata_path ~= nil,
         })
         if auto_bound_ok then
-          local auto_audio_name = get_filename(auto_audio_path) or auto_audio_path
-          local auto_bound_message = t("status.auto_bound_audio_from_srt_dir", auto_audio_name)
-          if metadata_message and metadata_message ~= "" then
-            metadata_message = metadata_message .. " / " .. auto_bound_message
-          else
-            metadata_message = auto_bound_message
-          end
+          auto_bound_count = auto_bound_count + 1
+          first_bound_audio_path = first_bound_audio_path or auto_audio_path
+        end
+      end
+      if auto_bound_count > 0 then
+        if first_bound_audio_path then
+          env.select_audio_by_path(first_bound_audio_path)
+        end
+        local auto_bound_message = t("status.auto_bound_audio_from_srt_dir", auto_bound_count)
+        if metadata_message and metadata_message ~= "" then
+          metadata_message = metadata_message .. " / " .. auto_bound_message
+        else
+          metadata_message = auto_bound_message
         end
       end
     end
@@ -502,37 +562,63 @@ return function(env)
     if not path or path == "" then
       return false, t("status.no_audio_file_selected")
     end
+    if is_supported_audio_file_path and not is_supported_audio_file_path(path) then
+      return false, t("status.unsupported_audio_file")
+    end
 
     local audio_length_sec = get_media_length_sec(path)
+    if not audio_length_sec then
+      return false, t("status.failed_get_audio_length")
+    end
 
-    app.source.audio_path = path
-    app.source.audio_name = get_filename(path)
-    app.source.audio_loaded = true
-    app.source.audio_length_sec = audio_length_sec
-    app.source.audio_missing = false
-    app.source.audio_missing_path = nil
+    sync_current_audio_offset_to_entry()
+
+    local audio_files = copy_audio_file_entries(app.source.audio_files)
+    local existing_index = find_audio_entry_index(audio_files, path)
+    local entry = existing_index and audio_files[existing_index] or nil
+    if not entry then
+      entry = {
+        path = path,
+        label = "",
+        is_primary = #audio_files == 0,
+        offset_ms = 0,
+        length_sec = audio_length_sec,
+      }
+      audio_files[#audio_files + 1] = entry
+    else
+      entry.length_sec = audio_length_sec
+      entry.offset_ms = parse_integer(entry.offset_ms, 0) or 0
+    end
+
+    set_audio_binding_entries(audio_files)
+    select_audio_entry(entry)
 
     if options.update_metadata ~= false then
-      set_audio_binding_entries({
-        {
-          path = path,
-          label = "primary",
-          is_primary = true,
-        }
-      })
+      sync_current_audio_offset_to_entry()
     end
 
-    if audio_length_sec then
-      app.ui.status = t("status.bound_audio_with_length", app.source.audio_name or path, audio_length_sec)
-    else
-      app.ui.status = t("status.bound_audio", app.source.audio_name or path)
-    end
+    app.ui.status = t("status.bound_audio_with_length", app.source.audio_name or path, audio_length_sec)
 
     if options.mark_dirty ~= false then
       env.mark_metadata_dirty()
     end
     invalidate_source_library_cache()
     remember_browse_file_path("audio", path)
+    return true, app.ui.status
+  end
+
+  env.select_audio_by_path = function(path)
+    sync_current_audio_offset_to_entry()
+    local entry = get_selected_audio_entry(app.source.audio_files, path)
+    if not entry then
+      app.ui.status = t("status.no_audio_file_bound")
+      return false, app.ui.status
+    end
+
+    select_audio_entry(entry)
+    env.mark_metadata_dirty()
+    invalidate_source_library_cache()
+    app.ui.status = t("status.selected_audio_binding", get_filename(entry.path) or entry.path)
     return true, app.ui.status
   end
 
